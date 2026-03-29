@@ -49,6 +49,14 @@ tasks:
     cmds:
       - go test ./...
 
+  render-example:
+    desc: Render an example display frame to docs/example-render.png
+    cmds:
+      - mkdir -p docs
+      - go run ./cmd/render-example/ -o docs/example-render.png
+    generates:
+      - docs/example-render.png
+
   deps:
     desc: Download all Go dependencies
     cmds:
