@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	disp, err := drm.New("/dev/dri/card0")
+	disp, err := drm.New(0)
 	if err != nil {
 		log.Fatalf("Failed to open DRM display: %v", err)
 	}

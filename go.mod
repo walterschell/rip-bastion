@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	fyne.io/fyne/v2 v2.7.3
+	github.com/NeowayLabs/drm v0.0.0-20190824133025-4939fc0ad345
 	golang.org/x/image v0.38.0
 	golang.org/x/sys v0.42.0
 )

@@ -1,14 +1,20 @@
 //go:build rpi
 
+// Package drm renders the system status dashboard to a DRM/KMS framebuffer.
+// It uses github.com/NeowayLabs/drm for mode-setting and dumb-buffer
+// management, and golang.org/x/sys/unix for memory-mapping the framebuffer.
+// No CGo is required.
 package drm
 
 import (
 	"fmt"
 	"image"
 	"image/color"
+	"os"
 	"strings"
-	"unsafe"
 
+	neoDRM "github.com/NeowayLabs/drm"
+	"github.com/NeowayLabs/drm/mode"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
 	"golang.org/x/image/math/fixed"
@@ -17,352 +23,139 @@ import (
 	"github.com/walterschell/rip-bastion/internal/sysinfo"
 )
 
-// Display dimensions
-const (
-	dispWidth  = 480
-	dispHeight = 320
-	dispBPP    = 16
-)
-
-// Color constants (RGB565)
-const (
-	colorBlack  uint16 = 0x0000
-	colorWhite  uint16 = 0xFFFF
-	colorGreen  uint16 = 0x07E0
-	colorRed    uint16 = 0xF800
-	colorYellow uint16 = 0xFFE0
-	colorGray   uint16 = 0x7BEF
-	colorCyan   uint16 = 0x07FF
-)
-
-// DRM ioctl magic number
-const drmIOCTLBase = 'd'
-
-// _IOWR builds an ioctl number for read/write operations.
-func _IOWR(t, nr, size uintptr) uintptr {
-	return (3 << 30) | (size << 16) | (t << 8) | nr
-}
-
-// _IOW builds an ioctl number for write operations.
-func _IOW(t, nr, size uintptr) uintptr {
-	return (1 << 30) | (size << 16) | (t << 8) | nr
-}
-
-// DRM ioctl numbers
-var (
-	ioctlModeGetResources = _IOWR(drmIOCTLBase, 0xA0, unsafe.Sizeof(drmModeCardRes{}))
-	ioctlModeGetConnector = _IOWR(drmIOCTLBase, 0xA7, unsafe.Sizeof(drmModeGetConnector{}))
-	ioctlModeGetEncoder   = _IOWR(drmIOCTLBase, 0xA6, unsafe.Sizeof(drmModeGetEncoder{}))
-	ioctlModeGetCRTC      = _IOWR(drmIOCTLBase, 0xA1, unsafe.Sizeof(drmModeCRTC{}))
-	ioctlModeSetCRTC      = _IOWR(drmIOCTLBase, 0xA2, unsafe.Sizeof(drmModeCRTC{}))
-	ioctlModeAddFB        = _IOWR(drmIOCTLBase, 0xAE, unsafe.Sizeof(drmModeAddFB{}))
-	ioctlModeCreateDumb   = _IOWR(drmIOCTLBase, 0xB2, unsafe.Sizeof(drmModeCreateDumb{}))
-	ioctlModeMapDumb      = _IOWR(drmIOCTLBase, 0xB3, unsafe.Sizeof(drmModeMapDumb{}))
-	ioctlModeDestroyDumb  = _IOW(drmIOCTLBase, 0xB4, unsafe.Sizeof(drmModeDestroyDumb{}))
-)
-
-// DRM ioctl structs (matching kernel drm.h / drm_mode.h)
-
-type drmModeCardRes struct {
-	FbIDPtr         uint64
-	CrtcIDPtr       uint64
-	ConnectorIDPtr  uint64
-	EncoderIDPtr    uint64
-	CountFBs        uint32
-	CountCRTCs      uint32
-	CountConnectors uint32
-	CountEncoders   uint32
-	MinWidth        uint32
-	MaxWidth        uint32
-	MinHeight       uint32
-	MaxHeight       uint32
-}
-
-type drmModeModeInfo struct {
-	Clock      uint32
-	Hdisplay   uint16
-	HsyncStart uint16
-	HsyncEnd   uint16
-	Htotal     uint16
-	Hskew      uint16
-	Vdisplay   uint16
-	VsyncStart uint16
-	VsyncEnd   uint16
-	Vtotal     uint16
-	Vscan      uint16
-	Vrefresh   uint32
-	Flags      uint32
-	Type       uint32
-	Name       [32]byte
-}
-
-type drmModeGetConnector struct {
-	EncodersPtr    uint64
-	ModesPtr       uint64
-	PropsPtr       uint64
-	PropValuesPtr  uint64
-	CountModes     uint32
-	CountProps     uint32
-	CountEncoders  uint32
-	EncoderID      uint32
-	ConnectorID    uint32
-	ConnectorType  uint32
-	ConnectorTypeID uint32
-	Connection     uint32
-	MmWidth        uint32
-	MmHeight       uint32
-	Subpixel       uint32
-	Pad            uint32
-}
-
-type drmModeGetEncoder struct {
-	EncoderID    uint32
-	EncoderType  uint32
-	CrtcID       uint32
-	PossibleCRTCs uint32
-	PossibleClones uint32
-}
-
-type drmModeCRTC struct {
-	SetConnectorsPtr uint64
-	CountConnectors  uint32
-	CrtcID           uint32
-	FbID             uint32
-	X                uint32
-	Y                uint32
-	GammaSize        uint32
-	ModeValid        uint32
-	Mode             drmModeModeInfo
-}
-
-type drmModeAddFB struct {
-	Width  uint32
-	Height uint32
-	Pitch  uint32
-	Bpp    uint32
-	Depth  uint32
-	Handle uint32
-	FbID   uint32
-}
-
-type drmModeCreateDumb struct {
-	Height uint32
-	Width  uint32
-	Bpp    uint32
-	Flags  uint32
-	Handle uint32
-	Pitch  uint32
-	Size   uint64
-}
-
-type drmModeMapDumb struct {
-	Handle uint32
-	Pad    uint32
-	Offset uint64
-}
-
-type drmModeDestroyDumb struct {
-	Handle uint32
-}
-
-// Display holds DRM display state.
+// Display wraps a DRM/KMS dumb framebuffer for a single connected output.
 type Display struct {
-	fd          int
-	width       uint32
-	height      uint32
-	fb          []byte
-	pitch       uint32
-	fbID        uint32
-	dumbHandle  uint32
-	crtcID      uint32
-	connID      uint32
-	savedCRTC   *drmModeCRTC
+	file      *os.File
+	modeset   *mode.SimpleModeset
+	mset      mode.Modeset
+	savedCRTC *mode.Crtc
+
+	fbID   uint32
+	handle uint32
+	pitch  uint32
+	size   uint64
+	data   []byte
+
+	width  uint16
+	height uint16
 }
 
-// New opens the DRM device and sets up the framebuffer.
-func New(device string) (*Display, error) {
-	fd, err := unix.Open(device, unix.O_RDWR|unix.O_CLOEXEC, 0)
+// New opens DRM card n (0 = /dev/dri/card0), selects the first connected
+// output, allocates a 32-bpp dumb framebuffer, and activates the CRTC.
+func New(cardN int) (*Display, error) {
+	file, err := neoDRM.OpenCard(cardN)
 	if err != nil {
-		return nil, fmt.Errorf("opening %s: %w", device, err)
+		return nil, fmt.Errorf("drm: open card%d: %w", cardN, err)
 	}
 
-	d := &Display{fd: fd, width: dispWidth, height: dispHeight}
+	if !neoDRM.HasDumbBuffer(file) {
+		file.Close()
+		return nil, fmt.Errorf("drm: card%d does not support dumb buffers", cardN)
+	}
 
-	if err := d.setup(); err != nil {
-		unix.Close(fd)
+	ms, err := mode.NewSimpleModeset(file)
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("drm: enumerate modes: %w", err)
+	}
+	if len(ms.Modesets) == 0 {
+		file.Close()
+		return nil, fmt.Errorf("drm: no connected outputs found")
+	}
+
+	mset := ms.Modesets[0]
+	d := &Display{
+		file:    file,
+		modeset: ms,
+		mset:    mset,
+		width:   mset.Width,
+		height:  mset.Height,
+	}
+
+	// Save the current CRTC so we can restore it on Close.
+	d.savedCRTC, err = mode.GetCrtc(file, mset.Crtc)
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("drm: save CRTC: %w", err)
+	}
+
+	if err := d.allocFramebuffer(); err != nil {
+		file.Close()
 		return nil, err
 	}
+
+	// Activate the CRTC with our new framebuffer.
+	if err := mode.SetCrtc(file, mset.Crtc, d.fbID, 0, 0, &mset.Conn, 1, &mset.Mode); err != nil {
+		d.freeFramebuffer()
+		file.Close()
+		return nil, fmt.Errorf("drm: SetCrtc: %w", err)
+	}
+
 	return d, nil
 }
 
-func ioctl(fd int, req uintptr, arg unsafe.Pointer) error {
-	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), req, uintptr(arg))
-	if errno != 0 {
-		return errno
-	}
-	return nil
-}
-
-func (d *Display) setup() error {
-	// Get card resources
-	var res drmModeCardRes
-	if err := ioctl(d.fd, ioctlModeGetResources, unsafe.Pointer(&res)); err != nil {
-		return fmt.Errorf("DRM_IOCTL_MODE_GETRESOURCES: %w", err)
-	}
-	if res.CountConnectors == 0 {
-		return fmt.Errorf("no DRM connectors found")
+// allocFramebuffer creates a 32-bpp dumb buffer, registers it as a
+// framebuffer, and memory-maps it.
+func (d *Display) allocFramebuffer() error {
+	fb, err := mode.CreateFB(d.file, d.width, d.height, 32)
+	if err != nil {
+		return fmt.Errorf("drm: CreateFB: %w", err)
 	}
 
-	// Allocate connector ID array and re-fetch
-	connIDs := make([]uint32, res.CountConnectors)
-	crtcIDs := make([]uint32, res.CountCRTCs)
-	res.ConnectorIDPtr = uint64(uintptr(unsafe.Pointer(&connIDs[0])))
-	if res.CountCRTCs > 0 {
-		res.CrtcIDPtr = uint64(uintptr(unsafe.Pointer(&crtcIDs[0])))
-	}
-	if err := ioctl(d.fd, ioctlModeGetResources, unsafe.Pointer(&res)); err != nil {
-		return fmt.Errorf("DRM_IOCTL_MODE_GETRESOURCES (2): %w", err)
+	fbID, err := mode.AddFB(d.file, d.width, d.height, 24, 32, fb.Pitch, fb.Handle)
+	if err != nil {
+		return fmt.Errorf("drm: AddFB: %w", err)
 	}
 
-	// Find a connected connector with modes
-	var connID uint32
-	var modeInfo drmModeModeInfo
-	var encoderID uint32
-	found := false
-
-	for _, cid := range connIDs {
-		conn := drmModeGetConnector{ConnectorID: cid}
-		if err := ioctl(d.fd, ioctlModeGetConnector, unsafe.Pointer(&conn)); err != nil {
-			continue
-		}
-		// Connection state: 1 = connected
-		if conn.Connection != 1 || conn.CountModes == 0 {
-			continue
-		}
-		// Get modes
-		modes := make([]drmModeModeInfo, conn.CountModes)
-		conn2 := drmModeGetConnector{
-			ConnectorID: cid,
-			ModesPtr:    uint64(uintptr(unsafe.Pointer(&modes[0]))),
-		}
-		if conn.CountEncoders > 0 {
-			encoders := make([]uint32, conn.CountEncoders)
-			conn2.EncodersPtr = uint64(uintptr(unsafe.Pointer(&encoders[0])))
-			conn2.CountEncoders = conn.CountEncoders
-		}
-		conn2.CountModes = conn.CountModes
-		conn2.CountProps = conn.CountProps
-		if conn.CountProps > 0 {
-			props := make([]uint32, conn.CountProps)
-			propVals := make([]uint64, conn.CountProps)
-			conn2.PropsPtr = uint64(uintptr(unsafe.Pointer(&props[0])))
-			conn2.PropValuesPtr = uint64(uintptr(unsafe.Pointer(&propVals[0])))
-		}
-		if err := ioctl(d.fd, ioctlModeGetConnector, unsafe.Pointer(&conn2)); err != nil {
-			continue
-		}
-		modeInfo = modes[0]
-		// Use actual display dimensions from mode
-		d.width = uint32(modeInfo.Hdisplay)
-		d.height = uint32(modeInfo.Vdisplay)
-		connID = cid
-		encoderID = conn2.EncoderID
-		found = true
-		break
-	}
-	if !found {
-		return fmt.Errorf("no connected DRM connector with modes found")
-	}
-	d.connID = connID
-
-	// Get encoder to find CRTC
-	enc := drmModeGetEncoder{EncoderID: encoderID}
-	if err := ioctl(d.fd, ioctlModeGetEncoder, unsafe.Pointer(&enc)); err != nil {
-		return fmt.Errorf("DRM_IOCTL_MODE_GETENCODER: %w", err)
-	}
-	crtcID := enc.CrtcID
-	if crtcID == 0 && res.CountCRTCs > 0 {
-		crtcID = crtcIDs[0]
-	}
-	d.crtcID = crtcID
-
-	// Save original CRTC state for restoration on close
-	savedCRTC := &drmModeCRTC{CrtcID: crtcID}
-	_ = ioctl(d.fd, ioctlModeGetCRTC, unsafe.Pointer(savedCRTC))
-	d.savedCRTC = savedCRTC
-
-	// Create dumb buffer
-	dumb := drmModeCreateDumb{
-		Width:  d.width,
-		Height: d.height,
-		Bpp:    dispBPP,
-	}
-	if err := ioctl(d.fd, ioctlModeCreateDumb, unsafe.Pointer(&dumb)); err != nil {
-		return fmt.Errorf("DRM_IOCTL_MODE_CREATE_DUMB: %w", err)
-	}
-	d.dumbHandle = dumb.Handle
-	d.pitch = dumb.Pitch
-
-	// Add framebuffer
-	addFB := drmModeAddFB{
-		Width:  d.width,
-		Height: d.height,
-		Pitch:  dumb.Pitch,
-		Bpp:    dispBPP,
-		Depth:  16,
-		Handle: dumb.Handle,
-	}
-	if err := ioctl(d.fd, ioctlModeAddFB, unsafe.Pointer(&addFB)); err != nil {
-		return fmt.Errorf("DRM_IOCTL_MODE_ADDFB: %w", err)
-	}
-	d.fbID = addFB.FbID
-
-	// Map dumb buffer
-	mapDumb := drmModeMapDumb{Handle: dumb.Handle}
-	if err := ioctl(d.fd, ioctlModeMapDumb, unsafe.Pointer(&mapDumb)); err != nil {
-		return fmt.Errorf("DRM_IOCTL_MODE_MAP_DUMB: %w", err)
+	offset, err := mode.MapDumb(d.file, fb.Handle)
+	if err != nil {
+		return fmt.Errorf("drm: MapDumb: %w", err)
 	}
 
-	size := int(dumb.Size)
-	fb, err := unix.Mmap(d.fd, int64(mapDumb.Offset), size,
+	data, err := unix.Mmap(int(d.file.Fd()), int64(offset), int(fb.Size),
 		unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
-		return fmt.Errorf("mmap framebuffer: %w", err)
-	}
-	d.fb = fb
-
-	// Set CRTC
-	setCRTC := drmModeCRTC{
-		CrtcID:           crtcID,
-		FbID:             addFB.FbID,
-		ModeValid:        1,
-		Mode:             modeInfo,
-		SetConnectorsPtr: uint64(uintptr(unsafe.Pointer(&connID))),
-		CountConnectors:  1,
-	}
-	if err := ioctl(d.fd, ioctlModeSetCRTC, unsafe.Pointer(&setCRTC)); err != nil {
-		return fmt.Errorf("DRM_IOCTL_MODE_SETCRTC: %w", err)
+		return fmt.Errorf("drm: mmap framebuffer: %w", err)
 	}
 
+	d.fbID = fbID
+	d.handle = fb.Handle
+	d.pitch = fb.Pitch
+	d.size = fb.Size
+	d.data = data
 	return nil
 }
 
-// Render renders the system snapshot to the DRM framebuffer.
+func (d *Display) freeFramebuffer() {
+	if d.data != nil {
+		_ = unix.Munmap(d.data)
+		d.data = nil
+	}
+	if d.handle != 0 {
+		_ = mode.DestroyDumb(d.file, d.handle)
+		d.handle = 0
+	}
+}
+
+// Render draws the system snapshot onto the framebuffer.
 func (d *Display) Render(snap *sysinfo.Snapshot) error {
 	img := image.NewNRGBA(image.Rect(0, 0, int(d.width), int(d.height)))
 
-	// Fill background black
+	// Black background.
 	for y := 0; y < int(d.height); y++ {
 		for x := 0; x < int(d.width); x++ {
 			img.SetNRGBA(x, y, color.NRGBA{0, 0, 0, 255})
 		}
 	}
 
-	white := image.NewUniform(color.NRGBA{255, 255, 255, 255})
-	green := image.NewUniform(color.NRGBA{0, 255, 136, 255})
-	red := image.NewUniform(color.NRGBA{255, 68, 68, 255})
-	cyan := image.NewUniform(color.NRGBA{0, 212, 255, 255})
-	gray := image.NewUniform(color.NRGBA{136, 136, 136, 255})
+	var (
+		white  = image.NewUniform(color.NRGBA{255, 255, 255, 255})
+		green  = image.NewUniform(color.NRGBA{0, 255, 136, 255})
+		red    = image.NewUniform(color.NRGBA{255, 68, 68, 255})
+		cyan   = image.NewUniform(color.NRGBA{0, 212, 255, 255})
+		gray   = image.NewUniform(color.NRGBA{136, 136, 136, 255})
+		msgClr = image.NewUniform(color.NRGBA{170, 255, 170, 255})
+	)
 
 	face := basicfont.Face7x13
 	lineH := 16
@@ -379,20 +172,21 @@ func (d *Display) Render(snap *sysinfo.Snapshot) error {
 	}
 
 	drawHRule := func(yy int) {
+		c := color.NRGBA{64, 64, 128, 255}
 		for x := 0; x < int(d.width); x++ {
-			img.SetNRGBA(x, yy, color.NRGBA{64, 64, 128, 255})
+			img.SetNRGBA(x, yy, c)
 		}
 	}
 
-	// Title
+	// Title row.
 	drawText(4, y, cyan, "rip-bastion")
 	y += lineH
 	drawHRule(y)
 	y += 4
 
-	// Network section
+	// Network.
 	if snap.Network != nil {
-		drawText(4, y, gray, "── Network ─────────────────────────────────")
+		drawText(4, y, gray, "\u2500\u2500 Network \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
 		y += lineH
 		drawText(4, y, white, fmt.Sprintf("Interface : %s", snap.Network.InterfaceName))
 		y += lineH
@@ -403,7 +197,7 @@ func (d *Display) Render(snap *sysinfo.Snapshot) error {
 		drawText(4, y, white, fmt.Sprintf("DNS       : %s", strings.Join(snap.Network.DNS, ", ")))
 		y += lineH
 	} else if errMsg, ok := snap.Errors["network"]; ok {
-		drawText(4, y, gray, "── Network ─────────────────────────────────")
+		drawText(4, y, gray, "\u2500\u2500 Network \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
 		y += lineH
 		drawText(4, y, red, "Error: "+errMsg)
 		y += lineH
@@ -411,15 +205,13 @@ func (d *Display) Render(snap *sysinfo.Snapshot) error {
 	drawHRule(y)
 	y += 4
 
-	// mDNS section
+	// mDNS.
 	if snap.MDNS != nil {
-		drawText(4, y, gray, "── mDNS ─────────────────────────────────────")
+		drawText(4, y, gray, "\u2500\u2500 mDNS \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
 		y += lineH
-		statusSrc := red
-		statusText := "○ Stopped"
+		statusSrc, statusText := red, "\u25cb Stopped"
 		if snap.MDNS.Running {
-			statusSrc = green
-			statusText = "● Running"
+			statusSrc, statusText = green, "\u25cf Running"
 		}
 		drawText(4, y, statusSrc, statusText)
 		drawText(100, y, white, snap.MDNS.Hostname)
@@ -428,15 +220,13 @@ func (d *Display) Render(snap *sysinfo.Snapshot) error {
 	drawHRule(y)
 	y += 4
 
-	// VPN section
+	// VPN.
 	if snap.VPN != nil {
-		drawText(4, y, gray, fmt.Sprintf("── VPN (%s) ────────────────────────────", snap.VPN.Name))
+		drawText(4, y, gray, fmt.Sprintf("\u2500\u2500 VPN (%s) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500", snap.VPN.Name))
 		y += lineH
-		statusSrc := red
-		statusText := "○ Disconnected"
+		statusSrc, statusText := red, "\u25cb Disconnected"
 		if snap.VPN.Connected {
-			statusSrc = green
-			statusText = "● Connected"
+			statusSrc, statusText = green, "\u25cf Connected"
 		}
 		drawText(4, y, statusSrc, statusText)
 		if snap.VPN.Connected {
@@ -445,59 +235,42 @@ func (d *Display) Render(snap *sysinfo.Snapshot) error {
 		y += lineH
 	}
 
-	// Messages section at bottom
+	// Messages area pinned to the bottom 80 pixels.
 	msgAreaTop := int(d.height) - 80
 	if y < msgAreaTop {
-		// Draw divider above messages area
-		for x := 0; x < int(d.width); x++ {
-			img.SetNRGBA(x, msgAreaTop-2, color.NRGBA{64, 64, 128, 255})
-		}
-		msgY := msgAreaTop + 13
-		drawText(4, msgAreaTop+2, gray, "── Messages ─────────────────────────────────")
-		msgY += lineH - 4
-		msgSrc := image.NewUniform(color.NRGBA{170, 255, 170, 255})
+		drawHRule(msgAreaTop - 2)
+		drawText(4, msgAreaTop+2, gray, "\u2500\u2500 Messages \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
+		msgY := msgAreaTop + 2 + lineH
 		for _, msg := range snap.Messages {
 			if msgY > int(d.height)-4 {
 				break
 			}
-			drawText(4, msgY, msgSrc, "▸ "+msg)
+			drawText(4, msgY, msgClr, "\u25b8 "+msg)
 			msgY += lineH
 		}
 	}
 
-	// Convert NRGBA image to RGB565 and copy to framebuffer
-	for y := 0; y < int(d.height); y++ {
-		for x := 0; x < int(d.width); x++ {
-			c := img.NRGBAAt(x, y)
-			r5 := uint16(c.R) >> 3
-			g6 := uint16(c.G) >> 2
-			b5 := uint16(c.B) >> 3
-			px := (r5 << 11) | (g6 << 5) | b5
-			off := y*int(d.pitch) + x*2
-			if off+1 < len(d.fb) {
-				d.fb[off] = byte(px)
-				d.fb[off+1] = byte(px >> 8)
+	// Blit the NRGBA image to the 32-bpp (XRGB8888) framebuffer.
+	for row := 0; row < int(d.height); row++ {
+		for col := 0; col < int(d.width); col++ {
+			c := img.NRGBAAt(col, row)
+			off := row*int(d.pitch) + col*4
+			if off+3 < len(d.data) {
+				d.data[off+0] = c.B
+				d.data[off+1] = c.G
+				d.data[off+2] = c.R
+				d.data[off+3] = 0
 			}
 		}
 	}
-
 	return nil
 }
 
-// Close releases DRM resources.
+// Close restores the saved CRTC and releases all DRM resources.
 func (d *Display) Close() error {
 	if d.savedCRTC != nil {
-		_ = ioctl(d.fd, ioctlModeSetCRTC, unsafe.Pointer(d.savedCRTC))
+		_ = d.modeset.SetCrtc(&d.mset, d.savedCRTC)
 	}
-	if d.fb != nil {
-		_ = unix.Munmap(d.fb)
-	}
-	if d.dumbHandle != 0 {
-		destroy := drmModeDestroyDumb{Handle: d.dumbHandle}
-		_ = ioctl(d.fd, ioctlModeDestroyDumb, unsafe.Pointer(&destroy))
-	}
-	if d.fd >= 0 {
-		return unix.Close(d.fd)
-	}
-	return nil
+	d.freeFramebuffer()
+	return d.file.Close()
 }
