@@ -501,5 +501,3 @@ func (d *Display) Close() error {
 	}
 	return nil
 }
-
-
