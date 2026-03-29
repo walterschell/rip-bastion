@@ -63,10 +63,14 @@ type Device interface {
 // golang.org/x/image/font renderer can draw directly onto any Device backend
 // without the backend knowing anything about fonts.
 //
-// At() always returns color.Transparent.  This is correct for binary bitmap
-// fonts (basicfont.Face7x13) where every glyph pixel is either fully opaque
-// or fully transparent, so the Over compositing operator never needs to read
-// the destination.
+// At() always returns color.Transparent.  This is safe for basicfont.Face7x13
+// because it is a 1-bit bitmap font: each glyph pixel is either fully opaque
+// (mask=0xFF) or fully transparent (mask=0).  Under the draw.Over operator
+// those two cases simplify to dst=src and dst=dst respectively — neither reads
+// the destination colour — so the stub At() is never consulted.
+//
+// Note: if this adapter is ever used with an anti-aliased font, At() would
+// need to return the actual current pixel colour to produce correct blending.
 type deviceCanvas struct {
 	dev    Device
 	bounds image.Rectangle
