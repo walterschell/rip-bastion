@@ -1,2 +1,6 @@
 # rip-bastion
-Raspery Pi Based VPN Endpoint
+Raspberry Pi Based VPN Endpoint
+
+## Example Display
+
+![Example render of the rip-bastion display](docs/example-render.png)
