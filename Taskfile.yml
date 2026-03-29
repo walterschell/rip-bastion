@@ -1,0 +1,55 @@
+version: '3'
+
+vars:
+  BINARY_NAME: rip-bastion
+  DEBUG_BINARY: rip-bastion-debug
+  PI_GOARCH: arm64
+  PI_GOOS: linux
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Cross-compile for Raspberry Pi (DRM/KMS, pure Go, arm64)
+    cmds:
+      - mkdir -p bin
+      - GOOS={{.PI_GOOS}} GOARCH={{.PI_GOARCH}} CGO_ENABLED=0 go build -tags rpi -o bin/{{.BINARY_NAME}} ./cmd/rip-bastion/
+    generates:
+      - bin/{{.BINARY_NAME}}
+
+  debug:
+    desc: Build local debug binary (Fyne + web, requires display)
+    cmds:
+      - mkdir -p bin
+      - CGO_ENABLED=1 go build -o bin/{{.DEBUG_BINARY}} ./cmd/debug/
+    generates:
+      - bin/{{.DEBUG_BINARY}}
+
+  run-debug:
+    desc: Build and run the debug binary locally
+    deps: [debug]
+    cmds:
+      - ./bin/{{.DEBUG_BINARY}}
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf bin/
+
+  lint:
+    desc: Run golangci-lint
+    cmds:
+      - golangci-lint run ./...
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test ./...
+
+  deps:
+    desc: Download all Go dependencies
+    cmds:
+      - go mod tidy

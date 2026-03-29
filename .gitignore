@@ -1,0 +1,5 @@
+# Build artifacts
+bin/
+debug
+rip-bastion
+*.test
