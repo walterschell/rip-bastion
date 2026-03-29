@@ -5,31 +5,43 @@ package display
 
 import (
 	"fmt"
+	"image"
 	"image/color"
 	"strings"
 	"sync"
 
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/basicfont"
+	"golang.org/x/image/math/fixed"
+
 	"github.com/walterschell/rip-bastion/internal/sysinfo"
 )
+
+// TextLineHeight is the vertical distance (in pixels) between successive text
+// baselines when using the default font (basicfont.Face7x13), including
+// leading.  All Device backends share this value because font metrics live
+// here, not in the hardware layer.
+const TextLineHeight = 16
 
 // Device is a generic drawing surface.  Rendering backends (DRM/KMS, Fyne
 // canvas, etc.) implement this interface so that SystemDisplay can operate on
 // any physical or virtual output without knowing its internals.
+//
+// Font rendering is intentionally absent from this interface: it is handled
+// once by the display package (see drawText) so that backends only need to
+// implement pixel-level and geometry primitives.
 type Device interface {
 	// Dimensions of the drawable area in pixels.
 	Width() int
 	Height() int
 
-	// TextLineHeight returns the vertical distance (in pixels) between
-	// successive text baselines, including leading.  SystemDisplay uses this
-	// to position every line on the screen.
-	TextLineHeight() int
+	// SetPixel sets a single pixel at (x, y) to colour c.  This is the only
+	// primitive required for font rendering; all text is rasterised by the
+	// display package and delivered to the device one pixel at a time.
+	SetPixel(x, y int, c color.Color)
 
 	// Clear fills the entire surface with the given colour.
 	Clear(c color.Color)
-
-	// DrawText draws a UTF-8 string with its baseline at pixel (x, y).
-	DrawText(x, y int, c color.Color, text string)
 
 	// DrawHLine draws a filled horizontal line from column x0 to x1 at row y.
 	DrawHLine(x0, x1, y int, c color.Color)
@@ -45,6 +57,42 @@ type Device interface {
 
 	// Close releases all resources held by the device.
 	Close() error
+}
+
+// deviceCanvas adapts a Device into a draw.Image so that the
+// golang.org/x/image/font renderer can draw directly onto any Device backend
+// without the backend knowing anything about fonts.
+//
+// At() always returns color.Transparent.  This is correct for binary bitmap
+// fonts (basicfont.Face7x13) where every glyph pixel is either fully opaque
+// or fully transparent, so the Over compositing operator never needs to read
+// the destination.
+type deviceCanvas struct {
+	dev    Device
+	bounds image.Rectangle
+}
+
+func (dc *deviceCanvas) Bounds() image.Rectangle              { return dc.bounds }
+func (dc *deviceCanvas) ColorModel() color.Model              { return color.RGBAModel }
+func (dc *deviceCanvas) At(x, y int) color.Color              { return color.Transparent }
+func (dc *deviceCanvas) Set(x, y int, c color.Color)          { dc.dev.SetPixel(x, y, c) }
+
+// drawText renders text onto dev with its baseline at pixel (x, y) using
+// colour c and the shared basicfont.Face7x13.  Font rendering is centralised
+// here so that Device implementations never need to deal with font metrics,
+// glyph masks, or the golang.org/x/image/font package.
+func drawText(dev Device, x, y int, c color.Color, text string) {
+	canvas := &deviceCanvas{
+		dev:    dev,
+		bounds: image.Rect(0, 0, dev.Width(), dev.Height()),
+	}
+	dr := &font.Drawer{
+		Dst:  canvas,
+		Src:  image.NewUniform(c),
+		Face: basicfont.Face7x13,
+		Dot:  fixed.Point26_6{X: fixed.I(x), Y: fixed.I(y)},
+	}
+	dr.DrawString(text)
 }
 
 // Dashboard colour palette.
@@ -102,34 +150,34 @@ func (sd *SystemDisplay) Render() error {
 	d := sd.dev
 	w := d.Width()
 	h := d.Height()
-	lh := d.TextLineHeight()
+	lh := TextLineHeight
 
 	d.Clear(ColorBackground)
 
 	y := lh - 2
 
 	// ── Title ────────────────────────────────────────────────────────────
-	d.DrawText(iconPadding, y, ColorTitle, "rip-bastion")
+	drawText(d, iconPadding, y, ColorTitle, "rip-bastion")
 	y += lh
 	d.DrawHLine(0, w-1, y, ColorDivider)
 	y += 4
 
 	// ── Network ──────────────────────────────────────────────────────────
 	if snap.Network != nil {
-		d.DrawText(iconPadding, y, ColorSectionHdr, "\u2500\u2500 Network")
+		drawText(d, iconPadding, y, ColorSectionHdr, "\u2500\u2500 Network")
 		y += lh
-		d.DrawText(iconPadding, y, ColorText, fmt.Sprintf("Interface : %s", snap.Network.InterfaceName))
+		drawText(d, iconPadding, y, ColorText, fmt.Sprintf("Interface : %s", snap.Network.InterfaceName))
 		y += lh
-		d.DrawText(iconPadding, y, ColorText, fmt.Sprintf("IP/Mask   : %s / %s", snap.Network.IP, snap.Network.Netmask))
+		drawText(d, iconPadding, y, ColorText, fmt.Sprintf("IP/Mask   : %s / %s", snap.Network.IP, snap.Network.Netmask))
 		y += lh
-		d.DrawText(iconPadding, y, ColorText, fmt.Sprintf("Gateway   : %s", snap.Network.Gateway))
+		drawText(d, iconPadding, y, ColorText, fmt.Sprintf("Gateway   : %s", snap.Network.Gateway))
 		y += lh
-		d.DrawText(iconPadding, y, ColorText, fmt.Sprintf("DNS       : %s", strings.Join(snap.Network.DNS, ", ")))
+		drawText(d, iconPadding, y, ColorText, fmt.Sprintf("DNS       : %s", strings.Join(snap.Network.DNS, ", ")))
 		y += lh
 	} else if errMsg, ok := snap.Errors["network"]; ok {
-		d.DrawText(iconPadding, y, ColorSectionHdr, "\u2500\u2500 Network")
+		drawText(d, iconPadding, y, ColorSectionHdr, "\u2500\u2500 Network")
 		y += lh
-		d.DrawText(iconPadding, y, ColorError, "Error: "+errMsg)
+		drawText(d, iconPadding, y, ColorError, "Error: "+errMsg)
 		y += lh
 	}
 	d.DrawHLine(0, w-1, y, ColorDivider)
@@ -137,15 +185,15 @@ func (sd *SystemDisplay) Render() error {
 
 	// ── mDNS ─────────────────────────────────────────────────────────────
 	if snap.MDNS != nil {
-		d.DrawText(iconPadding, y, ColorSectionHdr, "\u2500\u2500 mDNS")
+		drawText(d, iconPadding, y, ColorSectionHdr, "\u2500\u2500 mDNS")
 		y += lh
 		statText := "\u25cb Stopped"
 		if snap.MDNS.Running {
 			statText = "\u25cf Running"
 		}
 		textX := sd.drawStatusIndicator(snap.MDNS.Running, y, lh)
-		d.DrawText(textX, y, statusColour(snap.MDNS.Running), statText)
-		d.DrawText(textX+mdnsHostOffset, y, ColorText, snap.MDNS.Hostname)
+		drawText(d, textX, y, statusColour(snap.MDNS.Running), statText)
+		drawText(d, textX+mdnsHostOffset, y, ColorText, snap.MDNS.Hostname)
 		y += lh
 	}
 	d.DrawHLine(0, w-1, y, ColorDivider)
@@ -153,16 +201,16 @@ func (sd *SystemDisplay) Render() error {
 
 	// ── VPN ──────────────────────────────────────────────────────────────
 	if snap.VPN != nil {
-		d.DrawText(iconPadding, y, ColorSectionHdr, fmt.Sprintf("\u2500\u2500 VPN (%s)", snap.VPN.Name))
+		drawText(d, iconPadding, y, ColorSectionHdr, fmt.Sprintf("\u2500\u2500 VPN (%s)", snap.VPN.Name))
 		y += lh
 		statText := "\u25cb Disconnected"
 		if snap.VPN.Connected {
 			statText = "\u25cf Connected"
 		}
 		textX := sd.drawStatusIndicator(snap.VPN.Connected, y, lh)
-		d.DrawText(textX, y, statusColour(snap.VPN.Connected), statText)
+		drawText(d, textX, y, statusColour(snap.VPN.Connected), statText)
 		if snap.VPN.Connected {
-			d.DrawText(textX+vpnDetailsOff, y, ColorText, fmt.Sprintf("%s  %s", snap.VPN.Interface, snap.VPN.PeerIP))
+			drawText(d, textX+vpnDetailsOff, y, ColorText, fmt.Sprintf("%s  %s", snap.VPN.Interface, snap.VPN.PeerIP))
 		}
 		y += lh
 	}
@@ -171,13 +219,13 @@ func (sd *SystemDisplay) Render() error {
 	msgTop := h - 80
 	if y < msgTop {
 		d.DrawHLine(0, w-1, msgTop-2, ColorDivider)
-		d.DrawText(iconPadding, msgTop+2, ColorSectionHdr, "\u2500\u2500 Messages")
+		drawText(d, iconPadding, msgTop+2, ColorSectionHdr, "\u2500\u2500 Messages")
 		msgY := msgTop + 2 + lh
 		for _, msg := range snap.Messages {
 			if msgY > h-4 {
 				break
 			}
-			d.DrawText(iconPadding, msgY, ColorMessage, "\u25b8 "+msg)
+			drawText(d, iconPadding, msgY, ColorMessage, "\u25b8 "+msg)
 			msgY += lh
 		}
 	}

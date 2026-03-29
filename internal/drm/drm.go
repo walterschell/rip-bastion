@@ -14,15 +14,8 @@ import (
 
 	neoDRM "github.com/NeowayLabs/drm"
 	"github.com/NeowayLabs/drm/mode"
-	"golang.org/x/image/font"
-	"golang.org/x/image/font/basicfont"
-	"golang.org/x/image/math/fixed"
 	"golang.org/x/sys/unix"
 )
-
-// textLineH is the vertical distance between successive baselines for
-// basicfont.Face7x13.
-const textLineH = 16
 
 // Display is a DRM/KMS drawing surface that implements display.Device.
 // All draw calls operate on an in-memory image.NRGBA; Flush blits it to the
@@ -149,9 +142,21 @@ func (d *Display) Width() int { return d.width }
 // Height returns the framebuffer height in pixels.
 func (d *Display) Height() int { return d.height }
 
-// TextLineHeight returns the pixel distance between successive baselines for
-// the built-in 7x13 font.
-func (d *Display) TextLineHeight() int { return textLineH }
+// SetPixel sets the pixel at (x, y) in the off-screen image.  It is the
+// sole primitive required for font rendering; the display package rasterises
+// glyphs and delivers them here one pixel at a time.
+func (d *Display) SetPixel(x, y int, c color.Color) {
+	if x < 0 || x >= d.width || y < 0 || y >= d.height {
+		return
+	}
+	r32, g32, b32, a32 := c.RGBA()
+	d.img.SetNRGBA(x, y, color.NRGBA{
+		R: uint8(r32 >> 8),
+		G: uint8(g32 >> 8),
+		B: uint8(b32 >> 8),
+		A: uint8(a32 >> 8),
+	})
+}
 
 // Clear fills the entire off-screen image with colour c.
 func (d *Display) Clear(c color.Color) {
@@ -167,18 +172,6 @@ func (d *Display) Clear(c color.Color) {
 			d.img.SetNRGBA(x, y, nc)
 		}
 	}
-}
-
-// DrawText draws text at pixel (x, y) (y is the baseline) with colour c,
-// using the built-in 7x13 bitmap font.
-func (d *Display) DrawText(x, y int, c color.Color, text string) {
-	dr := &font.Drawer{
-		Dst:  d.img,
-		Src:  image.NewUniform(c),
-		Face: basicfont.Face7x13,
-		Dot:  fixed.Point26_6{X: fixed.I(x), Y: fixed.I(y)},
-	}
-	dr.DrawString(text)
 }
 
 // DrawHLine draws a horizontal line from column x0 to x1 at row y.
