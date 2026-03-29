@@ -1,8 +1,8 @@
 //go:build rpi
 
-// Package drm renders the system status dashboard to a DRM/KMS framebuffer.
-// It uses github.com/NeowayLabs/drm for mode-setting and dumb-buffer
-// management, and golang.org/x/sys/unix for memory-mapping the framebuffer.
+// Package drm implements the display.Device interface using a DRM/KMS dumb
+// framebuffer.  It uses github.com/NeowayLabs/drm for mode-setting and
+// dumb-buffer management, and golang.org/x/sys/unix for memory-mapping.
 // No CGo is required.
 package drm
 
@@ -11,7 +11,6 @@ import (
 	"image"
 	"image/color"
 	"os"
-	"strings"
 
 	neoDRM "github.com/NeowayLabs/drm"
 	"github.com/NeowayLabs/drm/mode"
@@ -19,28 +18,36 @@ import (
 	"golang.org/x/image/font/basicfont"
 	"golang.org/x/image/math/fixed"
 	"golang.org/x/sys/unix"
-
-	"github.com/walterschell/rip-bastion/internal/sysinfo"
 )
 
-// Display wraps a DRM/KMS dumb framebuffer for a single connected output.
+// textLineH is the vertical distance between successive baselines for
+// basicfont.Face7x13.
+const textLineH = 16
+
+// Display is a DRM/KMS drawing surface that implements display.Device.
+// All draw calls operate on an in-memory image.NRGBA; Flush blits it to the
+// 32-bpp (XRGB8888) DRM framebuffer.
 type Display struct {
 	file      *os.File
 	modeset   *mode.SimpleModeset
 	mset      mode.Modeset
 	savedCRTC *mode.Crtc
 
+	// DRM framebuffer state
 	fbID   uint32
 	handle uint32
 	pitch  uint32
 	size   uint64
 	data   []byte
 
-	width  uint16
-	height uint16
+	// Off-screen draw target
+	img *image.NRGBA
+
+	width  int
+	height int
 }
 
-// New opens DRM card n (0 = /dev/dri/card0), selects the first connected
+// New opens DRM card n (0 = /dev/dri/card0), discovers the first connected
 // output, allocates a 32-bpp dumb framebuffer, and activates the CRTC.
 func New(cardN int) (*Display, error) {
 	file, err := neoDRM.OpenCard(cardN)
@@ -68,11 +75,11 @@ func New(cardN int) (*Display, error) {
 		file:    file,
 		modeset: ms,
 		mset:    mset,
-		width:   mset.Width,
-		height:  mset.Height,
+		width:   int(mset.Width),
+		height:  int(mset.Height),
+		img:     image.NewNRGBA(image.Rect(0, 0, int(mset.Width), int(mset.Height))),
 	}
 
-	// Save the current CRTC so we can restore it on Close.
 	d.savedCRTC, err = mode.GetCrtc(file, mset.Crtc)
 	if err != nil {
 		file.Close()
@@ -84,7 +91,6 @@ func New(cardN int) (*Display, error) {
 		return nil, err
 	}
 
-	// Activate the CRTC with our new framebuffer.
 	if err := mode.SetCrtc(file, mset.Crtc, d.fbID, 0, 0, &mset.Conn, 1, &mset.Mode); err != nil {
 		d.freeFramebuffer()
 		file.Close()
@@ -94,15 +100,13 @@ func New(cardN int) (*Display, error) {
 	return d, nil
 }
 
-// allocFramebuffer creates a 32-bpp dumb buffer, registers it as a
-// framebuffer, and memory-maps it.
 func (d *Display) allocFramebuffer() error {
-	fb, err := mode.CreateFB(d.file, d.width, d.height, 32)
+	fb, err := mode.CreateFB(d.file, uint16(d.width), uint16(d.height), 32)
 	if err != nil {
 		return fmt.Errorf("drm: CreateFB: %w", err)
 	}
 
-	fbID, err := mode.AddFB(d.file, d.width, d.height, 24, 32, fb.Pitch, fb.Handle)
+	fbID, err := mode.AddFB(d.file, uint16(d.width), uint16(d.height), 24, 32, fb.Pitch, fb.Handle)
 	if err != nil {
 		return fmt.Errorf("drm: AddFB: %w", err)
 	}
@@ -137,123 +141,116 @@ func (d *Display) freeFramebuffer() {
 	}
 }
 
-// Render draws the system snapshot onto the framebuffer.
-func (d *Display) Render(snap *sysinfo.Snapshot) error {
-	img := image.NewNRGBA(image.Rect(0, 0, int(d.width), int(d.height)))
+// ── display.Device implementation ─────────────────────────────────────────
 
-	// Black background.
-	for y := 0; y < int(d.height); y++ {
-		for x := 0; x < int(d.width); x++ {
-			img.SetNRGBA(x, y, color.NRGBA{0, 0, 0, 255})
+// Width returns the framebuffer width in pixels.
+func (d *Display) Width() int { return d.width }
+
+// Height returns the framebuffer height in pixels.
+func (d *Display) Height() int { return d.height }
+
+// TextLineHeight returns the pixel distance between successive baselines for
+// the built-in 7x13 font.
+func (d *Display) TextLineHeight() int { return textLineH }
+
+// Clear fills the entire off-screen image with colour c.
+func (d *Display) Clear(c color.Color) {
+	r32, g32, b32, a32 := c.RGBA()
+	nc := color.NRGBA{
+		R: uint8(r32 >> 8),
+		G: uint8(g32 >> 8),
+		B: uint8(b32 >> 8),
+		A: uint8(a32 >> 8),
+	}
+	for y := 0; y < d.height; y++ {
+		for x := 0; x < d.width; x++ {
+			d.img.SetNRGBA(x, y, nc)
 		}
 	}
+}
 
-	var (
-		white  = image.NewUniform(color.NRGBA{255, 255, 255, 255})
-		green  = image.NewUniform(color.NRGBA{0, 255, 136, 255})
-		red    = image.NewUniform(color.NRGBA{255, 68, 68, 255})
-		cyan   = image.NewUniform(color.NRGBA{0, 212, 255, 255})
-		gray   = image.NewUniform(color.NRGBA{136, 136, 136, 255})
-		msgClr = image.NewUniform(color.NRGBA{170, 255, 170, 255})
-	)
-
-	face := basicfont.Face7x13
-	lineH := 16
-	y := 14
-
-	drawText := func(x, yy int, src *image.Uniform, text string) {
-		dr := &font.Drawer{
-			Dst:  img,
-			Src:  src,
-			Face: face,
-			Dot:  fixed.Point26_6{X: fixed.I(x), Y: fixed.I(yy)},
-		}
-		dr.DrawString(text)
+// DrawText draws text at pixel (x, y) (y is the baseline) with colour c,
+// using the built-in 7x13 bitmap font.
+func (d *Display) DrawText(x, y int, c color.Color, text string) {
+	dr := &font.Drawer{
+		Dst:  d.img,
+		Src:  image.NewUniform(c),
+		Face: basicfont.Face7x13,
+		Dot:  fixed.Point26_6{X: fixed.I(x), Y: fixed.I(y)},
 	}
+	dr.DrawString(text)
+}
 
-	drawHRule := func(yy int) {
-		c := color.NRGBA{64, 64, 128, 255}
-		for x := 0; x < int(d.width); x++ {
-			img.SetNRGBA(x, yy, c)
-		}
+// DrawHLine draws a horizontal line from column x0 to x1 at row y.
+func (d *Display) DrawHLine(x0, x1, y int, c color.Color) {
+	if y < 0 || y >= d.height {
+		return
 	}
-
-	// Title row.
-	drawText(4, y, cyan, "rip-bastion")
-	y += lineH
-	drawHRule(y)
-	y += 4
-
-	// Network.
-	if snap.Network != nil {
-		drawText(4, y, gray, "\u2500\u2500 Network \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
-		y += lineH
-		drawText(4, y, white, fmt.Sprintf("Interface : %s", snap.Network.InterfaceName))
-		y += lineH
-		drawText(4, y, white, fmt.Sprintf("IP/Mask   : %s / %s", snap.Network.IP, snap.Network.Netmask))
-		y += lineH
-		drawText(4, y, white, fmt.Sprintf("Gateway   : %s", snap.Network.Gateway))
-		y += lineH
-		drawText(4, y, white, fmt.Sprintf("DNS       : %s", strings.Join(snap.Network.DNS, ", ")))
-		y += lineH
-	} else if errMsg, ok := snap.Errors["network"]; ok {
-		drawText(4, y, gray, "\u2500\u2500 Network \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
-		y += lineH
-		drawText(4, y, red, "Error: "+errMsg)
-		y += lineH
+	if x0 < 0 {
+		x0 = 0
 	}
-	drawHRule(y)
-	y += 4
-
-	// mDNS.
-	if snap.MDNS != nil {
-		drawText(4, y, gray, "\u2500\u2500 mDNS \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
-		y += lineH
-		statusSrc, statusText := red, "\u25cb Stopped"
-		if snap.MDNS.Running {
-			statusSrc, statusText = green, "\u25cf Running"
-		}
-		drawText(4, y, statusSrc, statusText)
-		drawText(100, y, white, snap.MDNS.Hostname)
-		y += lineH
+	if x1 >= d.width {
+		x1 = d.width - 1
 	}
-	drawHRule(y)
-	y += 4
-
-	// VPN.
-	if snap.VPN != nil {
-		drawText(4, y, gray, fmt.Sprintf("\u2500\u2500 VPN (%s) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500", snap.VPN.Name))
-		y += lineH
-		statusSrc, statusText := red, "\u25cb Disconnected"
-		if snap.VPN.Connected {
-			statusSrc, statusText = green, "\u25cf Connected"
-		}
-		drawText(4, y, statusSrc, statusText)
-		if snap.VPN.Connected {
-			drawText(120, y, white, fmt.Sprintf("%s  %s", snap.VPN.Interface, snap.VPN.PeerIP))
-		}
-		y += lineH
+	r32, g32, b32, a32 := c.RGBA()
+	nc := color.NRGBA{
+		R: uint8(r32 >> 8),
+		G: uint8(g32 >> 8),
+		B: uint8(b32 >> 8),
+		A: uint8(a32 >> 8),
 	}
+	for x := x0; x <= x1; x++ {
+		d.img.SetNRGBA(x, y, nc)
+	}
+}
 
-	// Messages area pinned to the bottom 80 pixels.
-	msgAreaTop := int(d.height) - 80
-	if y < msgAreaTop {
-		drawHRule(msgAreaTop - 2)
-		drawText(4, msgAreaTop+2, gray, "\u2500\u2500 Messages \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
-		msgY := msgAreaTop + 2 + lineH
-		for _, msg := range snap.Messages {
-			if msgY > int(d.height)-4 {
-				break
+// DrawRect draws a filled axis-aligned rectangle.
+func (d *Display) DrawRect(x, y, w, h int, c color.Color) {
+	r32, g32, b32, a32 := c.RGBA()
+	nc := color.NRGBA{
+		R: uint8(r32 >> 8),
+		G: uint8(g32 >> 8),
+		B: uint8(b32 >> 8),
+		A: uint8(a32 >> 8),
+	}
+	for dy := 0; dy < h; dy++ {
+		for dx := 0; dx < w; dx++ {
+			px, py := x+dx, y+dy
+			if px >= 0 && px < d.width && py >= 0 && py < d.height {
+				d.img.SetNRGBA(px, py, nc)
 			}
-			drawText(4, msgY, msgClr, "\u25b8 "+msg)
-			msgY += lineH
 		}
 	}
+}
 
-	// Blit the NRGBA image to the 32-bpp (XRGB8888) framebuffer.
-	for row := 0; row < int(d.height); row++ {
-		for col := 0; col < int(d.width); col++ {
-			c := img.NRGBAAt(col, row)
+// DrawCircle draws a filled circle centred at (cx, cy) with radius r.
+func (d *Display) DrawCircle(cx, cy, r int, c color.Color) {
+	r32, g32, b32, a32 := c.RGBA()
+	nc := color.NRGBA{
+		R: uint8(r32 >> 8),
+		G: uint8(g32 >> 8),
+		B: uint8(b32 >> 8),
+		A: uint8(a32 >> 8),
+	}
+	r2 := r * r
+	for dy := -r; dy <= r; dy++ {
+		for dx := -r; dx <= r; dx++ {
+			if dx*dx+dy*dy <= r2 {
+				px, py := cx+dx, cy+dy
+				if px >= 0 && px < d.width && py >= 0 && py < d.height {
+					d.img.SetNRGBA(px, py, nc)
+				}
+			}
+		}
+	}
+}
+
+// Flush blits the off-screen NRGBA image to the 32-bpp (XRGB8888) DRM
+// framebuffer.
+func (d *Display) Flush() error {
+	for row := 0; row < d.height; row++ {
+		for col := 0; col < d.width; col++ {
+			c := d.img.NRGBAAt(col, row)
 			off := row*int(d.pitch) + col*4
 			if off+3 < len(d.data) {
 				d.data[off+0] = c.B
@@ -266,7 +263,7 @@ func (d *Display) Render(snap *sysinfo.Snapshot) error {
 	return nil
 }
 
-// Close restores the saved CRTC and releases all DRM resources.
+// Close restores the saved CRTC state and releases all DRM resources.
 func (d *Display) Close() error {
 	if d.savedCRTC != nil {
 		_ = d.modeset.SetCrtc(&d.mset, d.savedCRTC)
