@@ -40,7 +40,7 @@ func newLabel(text string) *widget.Label {
 func updateUI(labels *uiLabels, snap *sysinfo.Snapshot) {
 	if snap.Network != nil {
 		labels.iface.SetText(fmt.Sprintf("Interface : %s", snap.Network.InterfaceName))
-		labels.ipNet.SetText(fmt.Sprintf("IP/Mask   : %s / %s", snap.Network.IP, snap.Network.Netmask))
+		labels.ipNet.SetText(fmt.Sprintf("IP/CIDR   : %s", snap.Network.CIDR))
 		labels.gateway.SetText(fmt.Sprintf("Gateway   : %s", snap.Network.Gateway))
 		labels.dns.SetText(fmt.Sprintf("DNS       : %s", strings.Join(snap.Network.DNS, ", ")))
 	} else if errMsg, ok := snap.Errors["network"]; ok {

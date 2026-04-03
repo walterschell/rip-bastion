@@ -34,7 +34,7 @@ const tmplSource = `<!DOCTYPE html>
     <div class="section">
         <h3>Network</h3>
         <p><span class="label">Interface: </span><span class="value">{{.Network.InterfaceName}}</span></p>
-        <p><span class="label">IP Address: </span><span class="value">{{.Network.IP}}/{{.Network.Netmask}}</span></p>
+        <p><span class="label">IP Address: </span><span class="value">{{.Network.CIDR}}</span></p>
         <p><span class="label">Gateway: </span><span class="value">{{.Network.Gateway}}</span></p>
         <p><span class="label">DNS: </span><span class="value">{{range .Network.DNS}}{{.}} {{end}}</span></p>
     </div>

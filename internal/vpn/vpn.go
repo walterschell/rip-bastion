@@ -7,6 +7,7 @@ type Status struct {
 	Name      string // VPN provider name, e.g. "WireGuard"
 	Connected bool
 	Interface string // network interface name, e.g. "wg0"
+	LocalCIDR string // local interface address in CIDR notation, e.g. "10.0.0.2/24"
 	PeerIP    string // remote peer IP when connected
 }
 

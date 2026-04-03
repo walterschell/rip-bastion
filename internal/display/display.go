@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"math"
 	"strings"
 	"sync"
 
@@ -76,16 +77,17 @@ type deviceCanvas struct {
 	bounds image.Rectangle
 }
 
-func (dc *deviceCanvas) Bounds() image.Rectangle              { return dc.bounds }
-func (dc *deviceCanvas) ColorModel() color.Model              { return color.RGBAModel }
-func (dc *deviceCanvas) At(x, y int) color.Color              { return color.Transparent }
-func (dc *deviceCanvas) Set(x, y int, c color.Color)          { dc.dev.SetPixel(x, y, c) }
+func (dc *deviceCanvas) Bounds() image.Rectangle     { return dc.bounds }
+func (dc *deviceCanvas) ColorModel() color.Model     { return color.RGBAModel }
+func (dc *deviceCanvas) At(x, y int) color.Color     { return color.Transparent }
+func (dc *deviceCanvas) Set(x, y int, c color.Color) { dc.dev.SetPixel(x, y, c) }
 
 // drawText renders text onto dev with its baseline at pixel (x, y) using
 // colour c and the shared basicfont.Face7x13.  Font rendering is centralised
 // here so that Device implementations never need to deal with font metrics,
 // glyph masks, or the golang.org/x/image/font package.
-func drawText(dev Device, x, y int, c color.Color, text string) {
+
+func drawText(dev Device, x, y int, c color.Color, text string) (image.Rectangle, error) {
 	canvas := &deviceCanvas{
 		dev:    dev,
 		bounds: image.Rect(0, 0, dev.Width(), dev.Height()),
@@ -96,7 +98,39 @@ func drawText(dev Device, x, y int, c color.Color, text string) {
 		Face: basicfont.Face7x13,
 		Dot:  fixed.Point26_6{X: fixed.I(x), Y: fixed.I(y)},
 	}
+	bounds26_6, _ := dr.BoundString(text)
+	var err error = nil
+	bounds := image.Rectangle{
+		Min: image.Point{X: bounds26_6.Min.X.Round(), Y: bounds26_6.Min.Y.Round()},
+		Max: image.Point{X: bounds26_6.Max.X.Round(), Y: bounds26_6.Max.Y.Round()},
+	}
+	if !bounds.In(canvas.Bounds()) {
+		err = fmt.Errorf("text bounds %v exceed canvas %v", bounds, canvas.Bounds())
+	}
 	dr.DrawString(text)
+	return bounds, err
+}
+
+// drawSectionHeader renders a section title and draws a divider bar that
+// starts just after the rendered title bounds.
+func drawSectionHeader(dev Device, x, y int, title string) {
+	bounds, _ := drawText(dev, x, y, ColorSectionHdr, title)
+
+	lineStart := bounds.Max.X + 6
+	lineEnd := dev.Width() - 1
+	if lineStart > lineEnd {
+		return
+	}
+
+	lineY := bounds.Min.Y + bounds.Dy()/2
+	if lineY < 0 {
+		lineY = 0
+	}
+	if lineY >= dev.Height() {
+		lineY = dev.Height() - 1
+	}
+
+	dev.DrawHLine(lineStart, lineEnd, lineY, ColorDivider)
 }
 
 // Dashboard colour palette.
@@ -105,6 +139,8 @@ var (
 	ColorTitle      = color.RGBA{R: 0, G: 212, B: 255, A: 255}
 	ColorSectionHdr = color.RGBA{R: 136, G: 136, B: 136, A: 255}
 	ColorText       = color.RGBA{R: 255, G: 255, B: 255, A: 255}
+	ColorRX         = color.RGBA{R: 255, G: 196, B: 64, A: 255}
+	ColorTX         = color.RGBA{R: 64, G: 220, B: 255, A: 255}
 	ColorOK         = color.RGBA{R: 0, G: 255, B: 136, A: 255}
 	ColorError      = color.RGBA{R: 255, G: 68, B: 68, A: 255}
 	ColorDivider    = color.RGBA{R: 64, G: 64, B: 128, A: 255}
@@ -114,10 +150,8 @@ var (
 // Layout constants for the status indicator (circle + label) used for mDNS
 // and VPN rows.
 const (
-	iconPadding    = 4  // left-edge gap before the circle
-	iconTextGap    = 4  // gap between the circle's right edge and the text label
-	mdnsHostOffset = 90 // additional x offset to the hostname text
-	vpnDetailsOff  = 100 // additional x offset to VPN interface/peer text
+	iconPadding = 4 // left-edge gap before the circle
+	iconTextGap = 4 // gap between the circle's right edge and the text label
 )
 
 // SystemDisplay owns the current system state and renders it to a Device.
@@ -159,82 +193,527 @@ func (sd *SystemDisplay) Render() error {
 	d.Clear(ColorBackground)
 
 	y := lh - 2
+	y += 2
 
-	// ── Title ────────────────────────────────────────────────────────────
-	drawText(d, iconPadding, y, ColorTitle, "rip-bastion")
-	y += lh
-	d.DrawHLine(0, w-1, y, ColorDivider)
-	y += 4
+	graphW := w / 3
+	if graphW < 110 {
+		graphW = 110
+	}
+	if graphW > 170 {
+		graphW = 170
+	}
+	graphX := w - graphW - iconPadding
+	leftX := iconPadding
 
 	// ── Network ──────────────────────────────────────────────────────────
 	if snap.Network != nil {
-		drawText(d, iconPadding, y, ColorSectionHdr, "\u2500\u2500 Network")
+		drawSectionHeader(d, leftX, y, "Network")
 		y += lh
-		drawText(d, iconPadding, y, ColorText, fmt.Sprintf("Interface : %s", snap.Network.InterfaceName))
+		graphTop := y - 11
+		drawText(d, leftX, y, ColorText, fmt.Sprintf("Interface           : %s", snap.Network.InterfaceName))
 		y += lh
-		drawText(d, iconPadding, y, ColorText, fmt.Sprintf("IP/Mask   : %s / %s", snap.Network.IP, snap.Network.Netmask))
+		drawText(d, leftX, y, ColorText, fmt.Sprintf("IP/CIDR             : %s", networkCIDR(snap.Network.IP, snap.Network.Netmask, snap.Network.CIDR)))
 		y += lh
-		drawText(d, iconPadding, y, ColorText, fmt.Sprintf("Gateway   : %s", snap.Network.Gateway))
+		drawText(d, leftX, y, ColorText, fmt.Sprintf("Gateway             : %s", emptyDash(snap.Network.Gateway)))
 		y += lh
-		drawText(d, iconPadding, y, ColorText, fmt.Sprintf("DNS       : %s", strings.Join(snap.Network.DNS, ", ")))
+		drawText(d, leftX, y, ColorText, fmt.Sprintf("Detected External IP: %s", emptyDash(snap.Network.ExternalIP)))
 		y += lh
+		drawText(d, leftX, y, ColorText, fmt.Sprintf("DNS                 : %s", emptyDash(strings.Join(snap.Network.DNS, ", "))))
+		y += lh
+		drawBandwidthGraph(d, graphX, graphTop, graphW, lh*5-4, snap.NetworkRXBandwidthHistory, snap.NetworkTXBandwidthHistory, snap.NetworkRXKBps, snap.NetworkTXKBps)
 	} else if errMsg, ok := snap.Errors["network"]; ok {
-		drawText(d, iconPadding, y, ColorSectionHdr, "\u2500\u2500 Network")
+		drawSectionHeader(d, leftX, y, "Network")
 		y += lh
-		drawText(d, iconPadding, y, ColorError, "Error: "+errMsg)
+		drawText(d, leftX, y, ColorError, "Error: "+errMsg)
 		y += lh
 	}
-	d.DrawHLine(0, w-1, y, ColorDivider)
 	y += 4
 
-	// ── mDNS ─────────────────────────────────────────────────────────────
-	if snap.MDNS != nil {
-		drawText(d, iconPadding, y, ColorSectionHdr, "\u2500\u2500 mDNS")
-		y += lh
-		statText := "\u25cb Stopped"
-		if snap.MDNS.Running {
-			statText = "\u25cf Running"
-		}
-		textX := sd.drawStatusIndicator(snap.MDNS.Running, y, lh)
-		drawText(d, textX, y, statusColour(snap.MDNS.Running), statText)
-		drawText(d, textX+mdnsHostOffset, y, ColorText, snap.MDNS.Hostname)
+	// ── Services ─────────────────────────────────────────────────────────
+	drawSectionHeader(d, leftX, y, "Services")
+	y += lh
+
+	mdnsRunning := snap.MDNS != nil && snap.MDNS.Running
+	mdnsHost := "-"
+	if snap.MDNS != nil && snap.MDNS.Hostname != "" {
+		mdnsHost = snap.MDNS.Hostname
+	}
+	mdnsTextX := sd.drawStatusIndicator(mdnsRunning, y, lh)
+	drawText(d, mdnsTextX, y, ColorText, fmt.Sprintf("mDNS : %s", mdnsHost))
+	y += lh
+
+	sshRunning := snap.SSH != nil && snap.SSH.Running
+	sshTextX := sd.drawStatusIndicator(sshRunning, y, lh)
+	drawText(d, sshTextX, y, ColorText, "SSH")
+	y += lh
+
+	if errMsg, ok := snap.Errors["mdns"]; ok {
+		drawText(d, leftX, y, ColorError, "mDNS error: "+errMsg)
 		y += lh
 	}
-	d.DrawHLine(0, w-1, y, ColorDivider)
+	if errMsg, ok := snap.Errors["ssh"]; ok {
+		drawText(d, leftX, y, ColorError, "SSH error : "+errMsg)
+		y += lh
+	}
 	y += 4
 
 	// ── VPN ──────────────────────────────────────────────────────────────
 	if snap.VPN != nil {
-		drawText(d, iconPadding, y, ColorSectionHdr, fmt.Sprintf("\u2500\u2500 VPN (%s)", snap.VPN.Name))
+		drawSectionHeader(d, leftX, y, fmt.Sprintf("VPN (%s)", snap.VPN.Name))
 		y += lh
-		statText := "\u25cb Disconnected"
-		if snap.VPN.Connected {
-			statText = "\u25cf Connected"
-		}
+		graphTop := y - 11
 		textX := sd.drawStatusIndicator(snap.VPN.Connected, y, lh)
-		drawText(d, textX, y, statusColour(snap.VPN.Connected), statText)
-		if snap.VPN.Connected {
-			drawText(d, textX+vpnDetailsOff, y, ColorText, fmt.Sprintf("%s  %s", snap.VPN.Interface, snap.VPN.PeerIP))
+		ifaceLine := fmt.Sprintf("Iface: %s", emptyDash(snap.VPN.Interface))
+		if snap.VPN.LocalCIDR != "" {
+			ifaceLine += "  " + snap.VPN.LocalCIDR
 		}
+		drawText(d, textX, y, ColorText, ifaceLine)
+		y += lh
+		drawText(d, leftX, y, ColorText, fmt.Sprintf("Peer                 : %s", emptyDash(snap.VPN.PeerIP)))
+		y += lh
+		drawBandwidthGraph(d, graphX, graphTop, graphW, lh*3+8, snap.VPNRXBandwidthHistory, snap.VPNTXBandwidthHistory, snap.VPNRXKBps, snap.VPNTXKBps)
+	} else if errMsg, ok := snap.Errors["vpn"]; ok {
+		drawSectionHeader(d, leftX, y, "VPN")
+		y += lh
+		drawText(d, leftX, y, ColorError, "Error: "+errMsg)
 		y += lh
 	}
 
 	// ── Messages (pinned to the bottom 80 px) ────────────────────────────
 	msgTop := h - 80
-	if y < msgTop {
-		d.DrawHLine(0, w-1, msgTop-2, ColorDivider)
-		drawText(d, iconPadding, msgTop+2, ColorSectionHdr, "\u2500\u2500 Messages")
-		msgY := msgTop + 2 + lh
-		for _, msg := range snap.Messages {
-			if msgY > h-4 {
-				break
-			}
-			drawText(d, iconPadding, msgY, ColorMessage, "\u25b8 "+msg)
-			msgY += lh
+	drawSectionHeader(d, leftX, msgTop+2, "Messages")
+	msgY := msgTop + 2 + lh
+	for _, msg := range snap.Messages {
+		if msgY > h-4 {
+			break
 		}
+		drawText(d, leftX, msgY, ColorMessage, "- "+msg)
+		msgY += lh
 	}
 
 	return d.Flush()
+}
+
+func emptyDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "-"
+	}
+	return s
+}
+
+func networkCIDR(ip, netmask, cidr string) string {
+	if strings.TrimSpace(cidr) != "" {
+		return cidr
+	}
+	ip = strings.TrimSpace(ip)
+	netmask = strings.TrimSpace(netmask)
+	if ip == "" {
+		return "-"
+	}
+	if netmask == "" {
+		return ip
+	}
+	parts := strings.Split(netmask, ".")
+	if len(parts) != 4 {
+		return ip
+	}
+	ones := 0
+	for _, p := range parts {
+		var v int
+		_, err := fmt.Sscanf(p, "%d", &v)
+		if err != nil || v < 0 || v > 255 {
+			return ip
+		}
+		for i := 0; i < 8; i++ {
+			if (v & (1 << i)) != 0 {
+				ones++
+			}
+		}
+	}
+	return fmt.Sprintf("%s/%d", ip, ones)
+}
+
+func formatKBps(v float64) string {
+	if v < 1024 {
+		return fmt.Sprintf("%.1f KB/s", v)
+	}
+	return fmt.Sprintf("%.2f MB/s", v/1024.0)
+}
+
+func formatOverlayRate(v float64) string {
+	if v < 10 {
+		return fmt.Sprintf("%.1fK", v)
+	}
+	if v < 1024 {
+		return fmt.Sprintf("%.0fK", v)
+	}
+	mb := v / 1024.0
+	if mb < 10 {
+		return fmt.Sprintf("%.1fM", mb)
+	}
+	if mb < 1024 {
+		return fmt.Sprintf("%.0fM", mb)
+	}
+	gb := mb / 1024.0
+	return fmt.Sprintf("%.1fG", gb)
+}
+
+func drawBandwidthGraph(dev Device, x, y, w, h int, rxSeries, txSeries []float64, rxKBps, txKBps float64) {
+	if w <= 2 || h <= 4 {
+		return
+	}
+
+	const leftGutterW = 28
+	const bottomGutterH = 14
+
+	plotX := x + leftGutterW
+	plotW := w - leftGutterW
+	plotH := h - bottomGutterH
+	plotY := y
+	if plotW <= 2 || plotH <= 4 {
+		return
+	}
+
+	dev.DrawRect(x, y, w, h, color.RGBA{R: 10, G: 10, B: 18, A: 255})
+	dev.DrawRect(x, y+h-bottomGutterH, w, bottomGutterH, color.RGBA{R: 12, G: 12, B: 20, A: 255})
+
+	visibleCount := len(rxSeries)
+	if len(txSeries) > visibleCount {
+		visibleCount = len(txSeries)
+	}
+
+	if visibleCount == 0 {
+		return
+	}
+
+	rxVisible := visibleTail(rxSeries, visibleCount)
+	txVisible := visibleTail(txSeries, visibleCount)
+	maxV := maxVisibleSeriesValue(rxVisible, txVisible)
+	if maxV < 0.01 {
+		maxV = 0.01
+	}
+
+	// Compute blended scale-line rows before drawing columns.
+	scaleLines := computeScaleLines(maxV, plotH)
+
+	for col := 0; col < plotW; col++ {
+		sampleSlot := (col * visibleCount) / plotW
+		if sampleSlot >= visibleCount {
+			sampleSlot = visibleCount - 1
+		}
+		rxV := sampleAtVisibleSlot(rxSeries, visibleCount, sampleSlot)
+		txV := sampleAtVisibleSlot(txSeries, visibleCount, sampleSlot)
+		rxH := scaledBarHeight(rxV, maxV, plotH)
+		txH := scaledBarHeight(txV, maxV, plotH)
+		drawGraphColumn(dev, plotX+col, plotY, plotH, rxH, txH, scaleLines)
+	}
+
+	drawGraphDurationAxis(dev, plotX, plotY, plotW, plotH)
+	drawScaleLabelGutter(dev, x, plotY, leftGutterW, plotH, maxV)
+	drawGraphAnnotationGutter(dev, x, y+h-bottomGutterH, w, bottomGutterH, visibleCount, rxKBps, txKBps)
+}
+
+// drawGraphDurationAxis draws only the axis line and tick marks at the bottom
+// of the plot. Text annotations live in the bottom gutter.
+func drawGraphDurationAxis(dev Device, x, y, w, plotH int) {
+	if w <= 0 || plotH <= 0 {
+		return
+	}
+	axisY := y + plotH - 1
+	axisColor := color.RGBA{R: 48, G: 48, B: 80, A: 255}
+	dev.DrawHLine(x, x+w-1, axisY, axisColor)
+
+	tickXs := []int{x, x + w/4, x + w/2, x + (3*w)/4, x + w - 1}
+	for _, tickX := range tickXs {
+		dev.DrawRect(tickX, axisY-3, 1, 3, axisColor)
+	}
+
+	leftTickX := x
+	if leftTickX > 0 {
+		dev.DrawRect(leftTickX-1, axisY-3, 1, 3, axisColor)
+	}
+}
+
+func drawGraphAnnotationGutter(dev Device, x, y, w, h, samples int, rxKBps, txKBps float64) {
+	if w <= 0 || h <= 0 {
+		return
+	}
+	baseline := y + h - 2
+	leftText := fmt.Sprintf("RX %s", formatOverlayRate(rxKBps))
+	centerText := formatWindowDuration(samples)
+	rightText := fmt.Sprintf("TX %s", formatOverlayRate(txKBps))
+
+	drawText(dev, x+2, baseline, ColorRX, leftText)
+
+	centerW := len(centerText) * 7
+	centerX := x + (w-centerW)/2
+	if centerX < x+2 {
+		centerX = x + 2
+	}
+	drawText(dev, centerX, baseline, ColorSectionHdr, centerText)
+
+	rightW := len(rightText) * 7
+	rightX := x + w - rightW - 2
+	if rightX < x+2 {
+		rightX = x + 2
+	}
+	drawText(dev, rightX, baseline, ColorTX, rightText)
+}
+
+func drawScaleLabelGutter(dev Device, gutterX, plotY, gutterW, plotH int, maxV float64) {
+	if gutterW <= 0 || plotH <= 0 {
+		return
+	}
+
+	type scaleLabel struct {
+		text string
+		row  int
+	}
+
+	labels := []scaleLabel{
+		{text: formatScaleRate(maxV), row: 0},
+		{text: "G", row: scaleRow(1024.0*1024.0, maxV, plotH)},
+		{text: "M", row: scaleRow(1024.0, maxV, plotH)},
+		{text: "K", row: scaleRow(1.0, maxV, plotH)},
+		{text: "B", row: scaleRow(1.0/1024.0, maxV, plotH)},
+	}
+
+	lastBottom := -1 << 30
+	for idx, label := range labels {
+		if idx != 0 && label.row < 0 {
+			continue
+		}
+
+		baseline := plotY + 9
+		if idx != 0 {
+			baseline = plotY + label.row + 5
+		}
+
+		top := baseline - 13
+		bottom := baseline
+		if top <= lastBottom {
+			continue
+		}
+
+		drawText(dev, gutterX+2, baseline, ColorSectionHdr, label.text)
+		lastBottom = bottom
+	}
+}
+
+// computeScaleLines returns a map from plot-row-from-top to darkening factor
+// (0 = black, 1 = unchanged) for all gridlines that should be rendered.
+// Major gridlines (1 B/s, 1 KB/s, 1 MB/s, 1 GB/s) use factor 0.15 (near-black).
+// Sub-interval selection:
+//   - If at least one of {lastMajor×10, lastMajor×100} fits below maxV, render those.
+//   - Otherwise render {prevMajor×10, prevMajor×100} (between the previous two majors).
+func computeScaleLines(maxV float64, plotH int) map[int]float64 {
+	lines := make(map[int]float64)
+	majors := [4]float64{1.0 / 1024.0, 1.0, 1024.0, 1024.0 * 1024.0}
+
+	var visibleMajors []float64
+	for _, mv := range majors {
+		if r := scaleRow(mv, maxV, plotH); r >= 0 {
+			lines[r] = 0.15
+			visibleMajors = append(visibleMajors, mv)
+		}
+	}
+
+	if len(visibleMajors) == 0 {
+		return lines
+	}
+
+	lastMajor := visibleMajors[len(visibleMajors)-1]
+	sub10 := lastMajor * 10
+	sub100 := lastMajor * 100
+
+	if sub10 <= maxV || sub100 <= maxV {
+		// Condition 1: sub-intervals after the last full major.
+		if sub10 <= maxV {
+			if r := scaleRow(sub10, maxV, plotH); r >= 0 {
+				lines[r] = 0.55
+			}
+		}
+		if sub100 <= maxV {
+			if r := scaleRow(sub100, maxV, plotH); r >= 0 {
+				lines[r] = 0.80
+			}
+		}
+	} else {
+		// Condition 2: sub-intervals between the last major and the one before it.
+		var prevMajor float64
+		if len(visibleMajors) >= 2 {
+			prevMajor = visibleMajors[len(visibleMajors)-2]
+		} else {
+			for i, mv := range majors {
+				if mv == lastMajor && i > 0 {
+					prevMajor = majors[i-1]
+					break
+				}
+			}
+		}
+		if prevMajor > 0 {
+			if r := scaleRow(prevMajor*10, maxV, plotH); r >= 0 {
+				lines[r] = 0.55
+			}
+			if r := scaleRow(prevMajor*100, maxV, plotH); r >= 0 {
+				lines[r] = 0.80
+			}
+		}
+	}
+
+	return lines
+}
+
+// scaleRow converts a data value to a plot row index from the top.
+// Returns -1 if the row falls at or outside the plot boundary.
+func scaleRow(value, maxV float64, plotH int) int {
+	if value <= 0 || maxV <= 0 || plotH <= 0 || value > maxV {
+		return -1
+	}
+	ratio := math.Log1p(value) / math.Log1p(maxV)
+	barH := int(math.Round(ratio * float64(plotH)))
+	if barH <= 0 || barH >= plotH {
+		return -1
+	}
+	return plotH - barH
+}
+
+func scaledBarHeight(value, maxValue float64, plotH int) int {
+	if value <= 0 || plotH <= 0 {
+		return 0
+	}
+	ratio := math.Log1p(value) / math.Log1p(maxValue)
+	barH := int(math.Round(ratio * float64(plotH)))
+	if barH < 1 {
+		barH = 1
+	}
+	if barH > plotH {
+		barH = plotH
+	}
+	return barH
+}
+
+func maxVisibleSeriesValue(rxVisible, txVisible []float64) float64 {
+	maxValue := 0.0
+	for _, v := range rxVisible {
+		if v > maxValue {
+			maxValue = v
+		}
+	}
+	for _, v := range txVisible {
+		if v > maxValue {
+			maxValue = v
+		}
+	}
+	return maxValue
+}
+
+func visibleTail(series []float64, visibleCount int) []float64 {
+	if visibleCount <= 0 || len(series) == 0 {
+		return nil
+	}
+	start := len(series) - visibleCount
+	if start < 0 {
+		start = 0
+	}
+	return series[start:]
+}
+
+func sampleAtVisibleSlot(series []float64, visibleCount, slot int) float64 {
+	if len(series) == 0 || visibleCount <= 0 || slot < 0 || slot >= visibleCount {
+		return 0
+	}
+	start := len(series) - visibleCount
+	if start < 0 {
+		start = 0
+	}
+	idx := start + slot
+	if idx < 0 || idx >= len(series) {
+		return 0
+	}
+	return series[idx]
+}
+
+func drawGraphColumn(dev Device, x, y, plotH, rxH, txH int, lines map[int]float64) {
+	if plotH <= 0 {
+		return
+	}
+	bg := color.RGBA{10, 10, 18, 255}
+	blended := blendRGBA(ColorRX, ColorTX)
+	for row := 0; row < plotH; row++ {
+		fromBottom := plotH - row
+		hasRX := rxH >= fromBottom
+		hasTX := txH >= fromBottom
+
+		var c color.RGBA
+		switch {
+		case hasRX && hasTX:
+			c = blended
+		case hasRX:
+			c = ColorRX
+		case hasTX:
+			c = ColorTX
+		default:
+			c = bg
+		}
+
+		if factor, ok := lines[row]; ok {
+			c = darkenRGBA(c, factor)
+		}
+		dev.SetPixel(x, y+row, c)
+	}
+}
+
+func darkenRGBA(c color.RGBA, factor float64) color.RGBA {
+	return color.RGBA{
+		R: uint8(float64(c.R) * factor),
+		G: uint8(float64(c.G) * factor),
+		B: uint8(float64(c.B) * factor),
+		A: 255,
+	}
+}
+
+func blendRGBA(a, b color.RGBA) color.RGBA {
+	return color.RGBA{
+		R: uint8((uint16(a.R) + uint16(b.R)) / 2),
+		G: uint8((uint16(a.G) + uint16(b.G)) / 2),
+		B: uint8((uint16(a.B) + uint16(b.B)) / 2),
+		A: 255,
+	}
+}
+
+func formatWindowDuration(samples int) string {
+	seconds := samples * 5
+	if seconds < 60 {
+		return fmt.Sprintf("%ds", seconds)
+	}
+	minutes := seconds / 60
+	seconds = seconds % 60
+	if minutes < 60 {
+		return fmt.Sprintf("%dm%02ds", minutes, seconds)
+	}
+	hours := minutes / 60
+	minutes = minutes % 60
+	return fmt.Sprintf("%dh%02dm", hours, minutes)
+}
+
+func formatScaleRate(v float64) string {
+	if v <= 0 {
+		return "0"
+	}
+	bytesPerSec := v * 1024.0
+	if bytesPerSec < 1024 {
+		return fmt.Sprintf("%.0fB", bytesPerSec)
+	}
+	if v < 1024 {
+		return fmt.Sprintf("%.0fK", v)
+	}
+	mb := v / 1024.0
+	if mb < 1024 {
+		return fmt.Sprintf("%.1fM", mb)
+	}
+	gb := mb / 1024.0
+	return fmt.Sprintf("%.1fG", gb)
 }
 
 // drawStatusIndicator draws a filled status circle on the current line at
