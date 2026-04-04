@@ -3,6 +3,8 @@ version: '3'
 vars:
   BINARY_NAME: rip-bastion
   DEBUG_BINARY: rip-bastion-debug
+  SPI_PROBE_BINARY: rip-bastion-spi-probe
+  SCREEN_BORDER_DEBUG_BINARY: rip-bastion-screen-border-debug
   PI_GOARCH: arm64
   PI_GOOS: linux
 
@@ -27,6 +29,22 @@ tasks:
       - CGO_ENABLED=1 go build -o bin/{{.DEBUG_BINARY}} ./cmd/debug/
     generates:
       - bin/{{.DEBUG_BINARY}}
+
+  spi-probe:
+    desc: Cross-compile SPI panel probe binary for Raspberry Pi (no DRM/X)
+    cmds:
+      - mkdir -p bin
+      - GOOS={{.PI_GOOS}} GOARCH={{.PI_GOARCH}} CGO_ENABLED=0 go build -o bin/{{.SPI_PROBE_BINARY}} ./cmd/spi-probe/
+    generates:
+      - bin/{{.SPI_PROBE_BINARY}}
+
+  screen-border-debug:
+    desc: Cross-compile SPI screen border debug binary for Raspberry Pi
+    cmds:
+      - mkdir -p bin
+      - GOOS={{.PI_GOOS}} GOARCH={{.PI_GOARCH}} CGO_ENABLED=0 go build -tags rpi -o bin/{{.SCREEN_BORDER_DEBUG_BINARY}} ./cmd/screen-border-debug/
+    generates:
+      - bin/{{.SCREEN_BORDER_DEBUG_BINARY}}
 
   run-debug:
     desc: Build and run the debug binary locally

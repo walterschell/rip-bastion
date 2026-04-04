@@ -10,7 +10,11 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"log"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 
 	neoDRM "github.com/NeowayLabs/drm"
 	"github.com/NeowayLabs/drm/mode"
@@ -38,6 +42,37 @@ type Display struct {
 
 	width  int
 	height int
+}
+
+// NewAuto enumerates every card* device present in /dev/dri, tries each one
+// in order, and returns the first that supports dumb buffers and has a
+// connected output.  All per-card errors are logged so misconfigurations are
+// visible without being fatal.
+func NewAuto() (*Display, error) {
+	matches, err := filepath.Glob("/dev/dri/card*")
+	if err != nil || len(matches) == 0 {
+		return nil, fmt.Errorf("drm: no card devices found in /dev/dri")
+	}
+	sort.Strings(matches)
+
+	for _, path := range matches {
+		// Extract the trailing number from e.g. "/dev/dri/card1".
+		name := filepath.Base(path)
+		if !strings.HasPrefix(name, "card") {
+			continue
+		}
+		var cardN int
+		if _, scanErr := fmt.Sscanf(name, "card%d", &cardN); scanErr != nil {
+			continue
+		}
+		d, openErr := New(cardN)
+		if openErr != nil {
+			log.Printf("drm: skipping %s: %v", path, openErr)
+			continue
+		}
+		return d, nil
+	}
+	return nil, fmt.Errorf("drm: no usable DRM card found in /dev/dri")
 }
 
 // New opens DRM card n (0 = /dev/dri/card0), discovers the first connected

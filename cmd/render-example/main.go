@@ -16,9 +16,11 @@ import (
 
 func main() {
 	out := flag.String("o", "docs/example-render.png", "output PNG path")
+	width := flag.Int("width", 320, "render width in pixels")
+	height := flag.Int("height", 480, "render height in pixels")
 	flag.Parse()
 
-	dev := display.NewImageDevice(480, 320)
+	dev := display.NewImageDevice(*width, *height)
 	sd := display.NewSystemDisplay(dev)
 
 	snap := &sysinfo.Snapshot{

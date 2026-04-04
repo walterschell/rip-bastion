@@ -1,6 +1,6 @@
 # Build artifacts
 bin/
 debug
-rip-bastion
-render-example
+/rip-bastion
+/render-example
 *.test

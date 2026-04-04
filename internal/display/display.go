@@ -189,6 +189,13 @@ func (sd *SystemDisplay) Render() error {
 	w := d.Width()
 	h := d.Height()
 	lh := TextLineHeight
+	compact := h <= 320
+	msgBoxH := 80
+	if compact {
+		msgBoxH = 64
+	}
+	msgTop := h - msgBoxH
+	contentBottom := msgTop - 4
 
 	d.Clear(ColorBackground)
 
@@ -205,60 +212,109 @@ func (sd *SystemDisplay) Render() error {
 	graphX := w - graphW - iconPadding
 	leftX := iconPadding
 
+	canDrawLine := func(baseline int) bool {
+		return baseline <= contentBottom
+	}
+
+	sectionFits := func(topY int) bool {
+		return topY+lh <= contentBottom
+	}
+
 	// ── Network ──────────────────────────────────────────────────────────
-	if snap.Network != nil {
+	if snap.Network != nil && sectionFits(y) {
 		drawSectionHeader(d, leftX, y, "Network")
 		y += lh
 		graphTop := y - 11
-		drawText(d, leftX, y, ColorText, fmt.Sprintf("Interface           : %s", snap.Network.InterfaceName))
+		if canDrawLine(y) {
+			drawText(d, leftX, y, ColorText, fmt.Sprintf("Interface           : %s", snap.Network.InterfaceName))
+		}
 		y += lh
-		drawText(d, leftX, y, ColorText, fmt.Sprintf("IP/CIDR             : %s", networkCIDR(snap.Network.IP, snap.Network.Netmask, snap.Network.CIDR)))
+		if canDrawLine(y) {
+			drawText(d, leftX, y, ColorText, fmt.Sprintf("IP/CIDR             : %s", networkCIDR(snap.Network.IP, snap.Network.Netmask, snap.Network.CIDR)))
+		}
 		y += lh
-		drawText(d, leftX, y, ColorText, fmt.Sprintf("Gateway             : %s", emptyDash(snap.Network.Gateway)))
+		if canDrawLine(y) {
+			drawText(d, leftX, y, ColorText, fmt.Sprintf("Gateway             : %s", emptyDash(snap.Network.Gateway)))
+		}
 		y += lh
-		drawText(d, leftX, y, ColorText, fmt.Sprintf("Detected External IP: %s", emptyDash(snap.Network.ExternalIP)))
-		y += lh
-		drawText(d, leftX, y, ColorText, fmt.Sprintf("DNS                 : %s", emptyDash(strings.Join(snap.Network.DNS, ", "))))
-		y += lh
-		drawBandwidthGraph(d, graphX, graphTop, graphW, lh*5-4, snap.NetworkRXBandwidthHistory, snap.NetworkTXBandwidthHistory, snap.NetworkRXKBps, snap.NetworkTXKBps)
-	} else if errMsg, ok := snap.Errors["network"]; ok {
+		if !compact {
+			if canDrawLine(y) {
+				drawText(d, leftX, y, ColorText, fmt.Sprintf("Detected External IP: %s", emptyDash(snap.Network.ExternalIP)))
+			}
+			y += lh
+			if canDrawLine(y) {
+				drawText(d, leftX, y, ColorText, fmt.Sprintf("DNS                 : %s", emptyDash(strings.Join(snap.Network.DNS, ", "))))
+			}
+			y += lh
+			graphH := lh*5 - 4
+			maxGraphH := contentBottom - graphTop
+			if maxGraphH < graphH {
+				graphH = maxGraphH
+			}
+			if graphH >= 24 {
+				drawBandwidthGraph(d, graphX, graphTop, graphW, graphH, snap.NetworkRXBandwidthHistory, snap.NetworkTXBandwidthHistory, snap.NetworkRXKBps, snap.NetworkTXKBps)
+			}
+		} else {
+			graphH := lh*3 + 8
+			maxGraphH := contentBottom - graphTop
+			if maxGraphH < graphH {
+				graphH = maxGraphH
+			}
+			if graphH >= 24 {
+				drawBandwidthGraph(d, graphX, graphTop, graphW, graphH, snap.NetworkRXBandwidthHistory, snap.NetworkTXBandwidthHistory, snap.NetworkRXKBps, snap.NetworkTXKBps)
+			}
+		}
+	} else if errMsg, ok := snap.Errors["network"]; ok && sectionFits(y) {
 		drawSectionHeader(d, leftX, y, "Network")
 		y += lh
-		drawText(d, leftX, y, ColorError, "Error: "+errMsg)
+		if canDrawLine(y) {
+			drawText(d, leftX, y, ColorError, "Error: "+errMsg)
+		}
 		y += lh
 	}
 	y += 4
 
 	// ── Services ─────────────────────────────────────────────────────────
-	drawSectionHeader(d, leftX, y, "Services")
-	y += lh
-
-	mdnsRunning := snap.MDNS != nil && snap.MDNS.Running
-	mdnsHost := "-"
-	if snap.MDNS != nil && snap.MDNS.Hostname != "" {
-		mdnsHost = snap.MDNS.Hostname
-	}
-	mdnsTextX := sd.drawStatusIndicator(mdnsRunning, y, lh)
-	drawText(d, mdnsTextX, y, ColorText, fmt.Sprintf("mDNS : %s", mdnsHost))
-	y += lh
-
-	sshRunning := snap.SSH != nil && snap.SSH.Running
-	sshTextX := sd.drawStatusIndicator(sshRunning, y, lh)
-	drawText(d, sshTextX, y, ColorText, "SSH")
-	y += lh
-
-	if errMsg, ok := snap.Errors["mdns"]; ok {
-		drawText(d, leftX, y, ColorError, "mDNS error: "+errMsg)
+	if sectionFits(y) {
+		drawSectionHeader(d, leftX, y, "Services")
 		y += lh
-	}
-	if errMsg, ok := snap.Errors["ssh"]; ok {
-		drawText(d, leftX, y, ColorError, "SSH error : "+errMsg)
+
+		mdnsRunning := snap.MDNS != nil && snap.MDNS.Running
+		mdnsHost := "-"
+		if snap.MDNS != nil && snap.MDNS.Hostname != "" {
+			mdnsHost = snap.MDNS.Hostname
+		}
+		mdnsTextX := sd.drawStatusIndicator(mdnsRunning, y, lh)
+		if canDrawLine(y) {
+			drawText(d, mdnsTextX, y, ColorText, fmt.Sprintf("mDNS : %s", mdnsHost))
+		}
 		y += lh
+
+		sshRunning := snap.SSH != nil && snap.SSH.Running
+		sshTextX := sd.drawStatusIndicator(sshRunning, y, lh)
+		if canDrawLine(y) {
+			drawText(d, sshTextX, y, ColorText, "SSH")
+		}
+		y += lh
+
+		if errMsg, ok := snap.Errors["mdns"]; ok {
+			if canDrawLine(y) {
+				drawText(d, leftX, y, ColorError, "mDNS error: "+errMsg)
+			}
+			y += lh
+		}
+		if errMsg, ok := snap.Errors["ssh"]; ok {
+			if canDrawLine(y) {
+				drawText(d, leftX, y, ColorError, "SSH error : "+errMsg)
+			}
+			y += lh
+		}
+
+		y += 4
 	}
-	y += 4
 
 	// ── VPN ──────────────────────────────────────────────────────────────
-	if snap.VPN != nil {
+	if snap.VPN != nil && sectionFits(y) {
 		drawSectionHeader(d, leftX, y, fmt.Sprintf("VPN (%s)", snap.VPN.Name))
 		y += lh
 		graphTop := y - 11
@@ -267,20 +323,35 @@ func (sd *SystemDisplay) Render() error {
 		if snap.VPN.LocalCIDR != "" {
 			ifaceLine += "  " + snap.VPN.LocalCIDR
 		}
-		drawText(d, textX, y, ColorText, ifaceLine)
+		if canDrawLine(y) {
+			drawText(d, textX, y, ColorText, ifaceLine)
+		}
 		y += lh
-		drawText(d, leftX, y, ColorText, fmt.Sprintf("Peer                 : %s", emptyDash(snap.VPN.PeerIP)))
+		if canDrawLine(y) {
+			drawText(d, leftX, y, ColorText, fmt.Sprintf("Peer                 : %s", emptyDash(snap.VPN.PeerIP)))
+		}
 		y += lh
-		drawBandwidthGraph(d, graphX, graphTop, graphW, lh*3+8, snap.VPNRXBandwidthHistory, snap.VPNTXBandwidthHistory, snap.VPNRXKBps, snap.VPNTXKBps)
-	} else if errMsg, ok := snap.Errors["vpn"]; ok {
+		graphH := lh*3 + 8
+		if compact {
+			graphH = lh*2 + 8
+		}
+		maxGraphH := contentBottom - graphTop
+		if maxGraphH < graphH {
+			graphH = maxGraphH
+		}
+		if graphH >= 24 {
+			drawBandwidthGraph(d, graphX, graphTop, graphW, graphH, snap.VPNRXBandwidthHistory, snap.VPNTXBandwidthHistory, snap.VPNRXKBps, snap.VPNTXKBps)
+		}
+	} else if errMsg, ok := snap.Errors["vpn"]; ok && sectionFits(y) {
 		drawSectionHeader(d, leftX, y, "VPN")
 		y += lh
-		drawText(d, leftX, y, ColorError, "Error: "+errMsg)
+		if canDrawLine(y) {
+			drawText(d, leftX, y, ColorError, "Error: "+errMsg)
+		}
 		y += lh
 	}
 
 	// ── Messages (pinned to the bottom 80 px) ────────────────────────────
-	msgTop := h - 80
 	drawSectionHeader(d, leftX, msgTop+2, "Messages")
 	msgY := msgTop + 2 + lh
 	for _, msg := range snap.Messages {
