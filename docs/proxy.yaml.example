@@ -1,0 +1,39 @@
+# rip-bastion proxy configuration
+# Default path: /etc/rip-bastion/proxy.yaml
+#
+# The proxy listens on :80 (HTTP → HTTPS redirect) and :443 (HTTPS with
+# SNI-based routing).  Changes to this file are detected automatically and
+# applied without restarting the service.
+
+listen:
+  http: ":80"
+  https: ":443"
+
+tls:
+  # "self-signed" – a unique ECDSA cert is generated per route and stored
+  # on disk so it remains stable across service restarts/reboots.
+  # "provided"    – supply cert_file and key_file below (shared by all routes).
+  mode: self-signed
+  cert_dir: /var/lib/rip-bastion/proxy-certs
+  # cert_file: /etc/rip-bastion/tls/server.crt
+  # key_file: /etc/rip-bastion/tls/server.key
+
+routes:
+  - name: Home Assistant
+    host: homeassistant.local
+    target: http://192.168.1.100:8123
+    mdns: true
+
+  - name: Grafana
+    host: grafana.local
+    target: http://192.168.1.101:3000
+    mdns: true
+
+  - name: Local Dashboard
+    host: dashboard.local
+    target: http://192.168.1.102:9000
+    mdns: true
+
+fallback:
+  # Title shown on the catch-all route listing page.
+  title: "rip-bastion proxy"

@@ -2,12 +2,14 @@ package sysinfo
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/walterschell/rip-bastion/internal/mdns"
 	"github.com/walterschell/rip-bastion/internal/messages"
 	"github.com/walterschell/rip-bastion/internal/network"
+	"github.com/walterschell/rip-bastion/internal/proxy"
 	"github.com/walterschell/rip-bastion/internal/ssh"
 	"github.com/walterschell/rip-bastion/internal/vpn"
 )
@@ -26,14 +28,15 @@ type Snapshot struct {
 	VPNTXKBps                 float64
 	VPNRXBandwidthHistory     []float64
 	VPNTXBandwidthHistory     []float64
+	ProxySites                []string
 	Messages                  []string
 	Errors                    map[string]string // per-subsystem error strings
 }
 
 type ifaceBandwidthState struct {
-	lastRX  uint64
-	lastTX  uint64
-	lastAt  time.Time
+	lastRX    uint64
+	lastTX    uint64
+	lastAt    time.Time
 	rxHistory []float64
 	txHistory []float64
 }
@@ -45,13 +48,23 @@ type Collector struct {
 	vpnProvider vpn.Provider
 	msgStore    *messages.Store
 
-	vpnMu  sync.RWMutex
+	vpnMu   sync.RWMutex
 	vpnLast *vpn.Status
 	vpnErr  string
 
 	bwMu      sync.Mutex
 	ifaceBW   map[string]*ifaceBandwidthState
 	vpnIfLast string
+
+	stateMu            sync.Mutex
+	networkStateKnown  bool
+	networkUp          bool
+	lastNetworkSummary string
+	vpnStateKnown      bool
+	vpnConnected       bool
+	lastVPNSummary     string
+
+	proxyConfigPath string
 
 	cancel context.CancelFunc
 }
@@ -80,6 +93,14 @@ func NewCollector(vp vpn.Provider, ms *messages.Store) *Collector {
 	}
 
 	go c.watchVPN(ctx, vp.Subscribe(ctx))
+	return c
+}
+
+// NewCollectorWithProxyConfig is like NewCollector and additionally enriches
+// snapshots with proxy route labels loaded from proxyConfigPath.
+func NewCollectorWithProxyConfig(vp vpn.Provider, ms *messages.Store, proxyConfigPath string) *Collector {
+	c := NewCollector(vp, ms)
+	c.proxyConfigPath = proxyConfigPath
 	return c
 }
 
@@ -143,6 +164,15 @@ func (c *Collector) Collect() *Snapshot {
 		snap.SSH = sshStatus
 	}
 
+	if c.proxyConfigPath != "" {
+		sites, proxyErr := proxy.ConfiguredSiteLabels(c.proxyConfigPath)
+		if proxyErr != nil {
+			snap.Errors["proxy"] = proxyErr.Error()
+		} else {
+			snap.ProxySites = sites
+		}
+	}
+
 	c.vpnMu.RLock()
 	snap.VPN = c.vpnLast
 	if c.vpnErr != "" {
@@ -174,8 +204,72 @@ func (c *Collector) Collect() *Snapshot {
 		}
 	}
 
+	c.recordTransitions(snap)
+
 	snap.Messages = c.msgStore.All()
 	return snap
+}
+
+func (c *Collector) recordTransitions(snap *Snapshot) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+
+	// Network transitions.
+	networkUp := snap.Network != nil && snap.Errors["network"] == ""
+	networkSummary := "down"
+	if networkUp {
+		networkSummary = fmt.Sprintf("%s %s", snap.Network.InterfaceName, snap.Network.CIDR)
+	}
+
+	if !c.networkStateKnown {
+		c.networkStateKnown = true
+		c.networkUp = networkUp
+		c.lastNetworkSummary = networkSummary
+	} else {
+		switched := c.networkUp != networkUp
+		summaryChanged := networkUp && c.lastNetworkSummary != networkSummary
+		switch {
+		case switched && networkUp:
+			c.msgStore.Add("Network up: " + networkSummary)
+		case switched && !networkUp:
+			c.msgStore.Add("Network down")
+		case summaryChanged:
+			c.msgStore.Add("Network changed: " + networkSummary)
+		}
+		c.networkUp = networkUp
+		c.lastNetworkSummary = networkSummary
+	}
+
+	// VPN transitions.
+	vpnConnected := snap.VPN != nil && snap.VPN.Connected
+	vpnName := "VPN"
+	if snap.VPN != nil && snap.VPN.Name != "" {
+		vpnName = snap.VPN.Name
+	}
+	vpnSummary := vpnName
+	if snap.VPN != nil && snap.VPN.PeerIP != "" {
+		vpnSummary = fmt.Sprintf("%s %s", vpnName, snap.VPN.PeerIP)
+	}
+
+	if !c.vpnStateKnown {
+		c.vpnStateKnown = true
+		c.vpnConnected = vpnConnected
+		c.lastVPNSummary = vpnSummary
+		return
+	}
+
+	vpnSwitched := c.vpnConnected != vpnConnected
+	vpnChanged := vpnConnected && c.lastVPNSummary != vpnSummary
+	switch {
+	case vpnSwitched && vpnConnected:
+		c.msgStore.Add("VPN connected: " + vpnSummary)
+	case vpnSwitched && !vpnConnected:
+		c.msgStore.Add("VPN disconnected")
+	case vpnChanged:
+		c.msgStore.Add("VPN changed: " + vpnSummary)
+	}
+	c.vpnConnected = vpnConnected
+	c.lastVPNSummary = vpnSummary
 }
 
 func (c *Collector) sampleInterfaceBandwidth(iface string) (rxKBps, txKBps float64, rxHistory, txHistory []float64, err error) {

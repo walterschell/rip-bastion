@@ -23,7 +23,7 @@ const tmplSource = `<!DOCTYPE html>
         .label { color: #888; }
         .value { color: #fff; font-weight: bold; }
         .ok { color: #00ff88; }
-        .err { color: #ff4444; }
+        .err { color: #ff0000; }
         .messages { background: #0d0d1a; padding: 10px; border-radius: 4px; }
         .msg { color: #aaffaa; margin: 2px 0; }
     </style>
@@ -60,7 +60,7 @@ const tmplSource = `<!DOCTYPE html>
         </p>
         {{ if .VPN.Connected }}
         <p><span class="label">Interface: </span><span class="value">{{.VPN.Interface}}</span></p>
-        <p><span class="label">Peer IP: </span><span class="value">{{.VPN.PeerIP}}</span></p>
+        <p><span class="label">Peer / Node: </span><span class="value">{{.VPN.PeerIP}}</span></p>
         {{ end }}
     </div>
     {{ end }}

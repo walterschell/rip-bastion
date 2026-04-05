@@ -42,7 +42,7 @@ const (
 	defaultYOff         = 0
 	defaultMADCTL       = 0x28
 	defaultPixelFmt     = 0x66 // RGB666
-	defaultColorOrd     = "grb"
+	defaultColorOrd     = "rgb"
 	defaultColumnMajor  = false
 	defaultPackPixels16 = false
 )

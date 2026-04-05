@@ -18,6 +18,7 @@ func main() {
 	out := flag.String("o", "docs/example-render.png", "output PNG path")
 	width := flag.Int("width", 320, "render width in pixels")
 	height := flag.Int("height", 480, "render height in pixels")
+	notice := flag.Bool("notice", false, "render the needs-reboot shutdown notice instead of the status screen")
 	flag.Parse()
 
 	dev := display.NewImageDevice(*width, *height)
@@ -78,8 +79,14 @@ func main() {
 	}
 
 	sd.Update(snap)
-	if err := sd.Render(); err != nil {
-		log.Fatalf("render: %v", err)
+	if *notice {
+		if err := sd.RenderNeedsRebootNotice(); err != nil {
+			log.Fatalf("render notice: %v", err)
+		}
+	} else {
+		if err := sd.Render(); err != nil {
+			log.Fatalf("render: %v", err)
+		}
 	}
 	if err := dev.SavePNG(*out); err != nil {
 		log.Fatalf("save PNG: %v", err)

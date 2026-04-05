@@ -133,6 +133,23 @@ func drawSectionHeader(dev Device, x, y int, title string) {
 	dev.DrawHLine(lineStart, lineEnd, lineY, ColorDivider)
 }
 
+func sectionHeaderDividerY(baseline int, title string) int {
+	bounds := textBounds(title)
+	return baseline + bounds.Min.Y + bounds.Dy()/2
+}
+
+// drawSectionHeaderWithStatus renders a status circle immediately before the
+// section title, then draws the title and divider.
+func drawSectionHeaderWithStatus(dev Device, x, y int, title string, ok bool) {
+	cr := TextLineHeight/2 - 2
+	cx := x + cr
+	cy := y - cr
+	dev.DrawCircle(cx, cy, cr, statusColour(ok))
+
+	titleX := cx + cr + iconTextGap
+	drawSectionHeader(dev, titleX, y, title)
+}
+
 // Dashboard colour palette.
 var (
 	ColorBackground = color.RGBA{R: 0, G: 0, B: 0, A: 255}
@@ -141,10 +158,13 @@ var (
 	ColorText       = color.RGBA{R: 255, G: 255, B: 255, A: 255}
 	ColorRX         = color.RGBA{R: 255, G: 196, B: 64, A: 255}
 	ColorTX         = color.RGBA{R: 64, G: 220, B: 255, A: 255}
-	ColorOK         = color.RGBA{R: 0, G: 255, B: 136, A: 255}
-	ColorError      = color.RGBA{R: 255, G: 68, B: 68, A: 255}
+	ColorOK         = color.RGBA{R: 0, G: 255, B: 0, A: 255}
+	ColorError      = color.RGBA{R: 255, G: 0, B: 0, A: 255}
 	ColorDivider    = color.RGBA{R: 64, G: 64, B: 128, A: 255}
 	ColorMessage    = color.RGBA{R: 170, G: 255, B: 170, A: 255}
+	ColorWarningBg  = color.RGBA{R: 255, G: 221, B: 0, A: 255}
+	ColorWarningInk = color.RGBA{R: 0, G: 0, B: 0, A: 255}
+	ColorWarningTxt = color.RGBA{R: 255, G: 0, B: 0, A: 255}
 )
 
 // Layout constants for the status indicator (circle + label) used for mDNS
@@ -153,6 +173,12 @@ const (
 	iconPadding = 4 // left-edge gap before the circle
 	iconTextGap = 4 // gap between the circle's right edge and the text label
 )
+
+type statusTableEntry struct {
+	label     string
+	ok        bool
+	textColor color.Color
+}
 
 // SystemDisplay owns the current system state and renders it to a Device.
 // Update and Render may be called from different goroutines.
@@ -190,12 +216,7 @@ func (sd *SystemDisplay) Render() error {
 	h := d.Height()
 	lh := TextLineHeight
 	compact := h <= 320
-	msgBoxH := 80
-	if compact {
-		msgBoxH = 64
-	}
-	msgTop := h - msgBoxH
-	contentBottom := msgTop - 4
+	contentBottom := h - 4
 
 	d.Clear(ColorBackground)
 
@@ -220,30 +241,55 @@ func (sd *SystemDisplay) Render() error {
 		return topY+lh <= contentBottom
 	}
 
+	lowestRenderedY := -1
+	markRendered := func(bottomY int) {
+		if bottomY > lowestRenderedY {
+			lowestRenderedY = bottomY
+		}
+	}
+	alignSectionTop := func(topY int, title string) int {
+		if lowestRenderedY < 0 {
+			return topY
+		}
+		minDividerY := lowestRenderedY + 2
+		dividerY := sectionHeaderDividerY(topY, title)
+		if dividerY < minDividerY {
+			topY += minDividerY - dividerY
+		}
+		return topY
+	}
+
 	// ── Network ──────────────────────────────────────────────────────────
 	if snap.Network != nil && sectionFits(y) {
-		drawSectionHeader(d, leftX, y, "Network")
+		y = alignSectionTop(y, "Network")
+		drawSectionHeaderWithStatus(d, leftX, y, "Network", true)
+		markRendered(sectionHeaderDividerY(y, "Network"))
 		y += lh
 		graphTop := y - 11
 		if canDrawLine(y) {
 			drawText(d, leftX, y, ColorText, fmt.Sprintf("Interface           : %s", snap.Network.InterfaceName))
+			markRendered(y)
 		}
 		y += lh
 		if canDrawLine(y) {
 			drawText(d, leftX, y, ColorText, fmt.Sprintf("IP/CIDR             : %s", networkCIDR(snap.Network.IP, snap.Network.Netmask, snap.Network.CIDR)))
+			markRendered(y)
 		}
 		y += lh
 		if canDrawLine(y) {
 			drawText(d, leftX, y, ColorText, fmt.Sprintf("Gateway             : %s", emptyDash(snap.Network.Gateway)))
+			markRendered(y)
 		}
 		y += lh
 		if !compact {
 			if canDrawLine(y) {
 				drawText(d, leftX, y, ColorText, fmt.Sprintf("Detected External IP: %s", emptyDash(snap.Network.ExternalIP)))
+				markRendered(y)
 			}
 			y += lh
 			if canDrawLine(y) {
 				drawText(d, leftX, y, ColorText, fmt.Sprintf("DNS                 : %s", emptyDash(strings.Join(snap.Network.DNS, ", "))))
+				markRendered(y)
 			}
 			y += lh
 			graphH := lh*5 - 4
@@ -253,6 +299,7 @@ func (sd *SystemDisplay) Render() error {
 			}
 			if graphH >= 24 {
 				drawBandwidthGraph(d, graphX, graphTop, graphW, graphH, snap.NetworkRXBandwidthHistory, snap.NetworkTXBandwidthHistory, snap.NetworkRXKBps, snap.NetworkTXKBps)
+				markRendered(graphTop + graphH - 1)
 			}
 		} else {
 			graphH := lh*3 + 8
@@ -262,73 +309,42 @@ func (sd *SystemDisplay) Render() error {
 			}
 			if graphH >= 24 {
 				drawBandwidthGraph(d, graphX, graphTop, graphW, graphH, snap.NetworkRXBandwidthHistory, snap.NetworkTXBandwidthHistory, snap.NetworkRXKBps, snap.NetworkTXKBps)
+				markRendered(graphTop + graphH - 1)
 			}
 		}
 	} else if errMsg, ok := snap.Errors["network"]; ok && sectionFits(y) {
-		drawSectionHeader(d, leftX, y, "Network")
+		y = alignSectionTop(y, "Network")
+		drawSectionHeaderWithStatus(d, leftX, y, "Network", false)
+		markRendered(sectionHeaderDividerY(y, "Network"))
 		y += lh
 		if canDrawLine(y) {
 			drawText(d, leftX, y, ColorError, "Error: "+errMsg)
+			markRendered(y)
 		}
 		y += lh
 	}
-	y += 4
-
-	// ── Services ─────────────────────────────────────────────────────────
-	if sectionFits(y) {
-		drawSectionHeader(d, leftX, y, "Services")
-		y += lh
-
-		mdnsRunning := snap.MDNS != nil && snap.MDNS.Running
-		mdnsHost := "-"
-		if snap.MDNS != nil && snap.MDNS.Hostname != "" {
-			mdnsHost = snap.MDNS.Hostname
-		}
-		mdnsTextX := sd.drawStatusIndicator(mdnsRunning, y, lh)
-		if canDrawLine(y) {
-			drawText(d, mdnsTextX, y, ColorText, fmt.Sprintf("mDNS : %s", mdnsHost))
-		}
-		y += lh
-
-		sshRunning := snap.SSH != nil && snap.SSH.Running
-		sshTextX := sd.drawStatusIndicator(sshRunning, y, lh)
-		if canDrawLine(y) {
-			drawText(d, sshTextX, y, ColorText, "SSH")
-		}
-		y += lh
-
-		if errMsg, ok := snap.Errors["mdns"]; ok {
-			if canDrawLine(y) {
-				drawText(d, leftX, y, ColorError, "mDNS error: "+errMsg)
-			}
-			y += lh
-		}
-		if errMsg, ok := snap.Errors["ssh"]; ok {
-			if canDrawLine(y) {
-				drawText(d, leftX, y, ColorError, "SSH error : "+errMsg)
-			}
-			y += lh
-		}
-
-		y += 4
-	}
+	y += 2
 
 	// ── VPN ──────────────────────────────────────────────────────────────
 	if snap.VPN != nil && sectionFits(y) {
-		drawSectionHeader(d, leftX, y, fmt.Sprintf("VPN (%s)", snap.VPN.Name))
+		vpnTitle := fmt.Sprintf("VPN (%s)", snap.VPN.Name)
+		y = alignSectionTop(y, vpnTitle)
+		drawSectionHeaderWithStatus(d, leftX, y, vpnTitle, snap.VPN.Connected)
+		markRendered(sectionHeaderDividerY(y, vpnTitle))
 		y += lh
 		graphTop := y - 11
-		textX := sd.drawStatusIndicator(snap.VPN.Connected, y, lh)
 		ifaceLine := fmt.Sprintf("Iface: %s", emptyDash(snap.VPN.Interface))
 		if snap.VPN.LocalCIDR != "" {
 			ifaceLine += "  " + snap.VPN.LocalCIDR
 		}
 		if canDrawLine(y) {
-			drawText(d, textX, y, ColorText, ifaceLine)
+			drawText(d, leftX, y, ColorText, ifaceLine)
+			markRendered(y)
 		}
 		y += lh
 		if canDrawLine(y) {
-			drawText(d, leftX, y, ColorText, fmt.Sprintf("Peer                 : %s", emptyDash(snap.VPN.PeerIP)))
+			drawText(d, leftX, y, ColorText, fmt.Sprintf("Peer / Node          : %s", emptyDash(snap.VPN.PeerIP)))
+			markRendered(y)
 		}
 		y += lh
 		graphH := lh*3 + 8
@@ -341,25 +357,194 @@ func (sd *SystemDisplay) Render() error {
 		}
 		if graphH >= 24 {
 			drawBandwidthGraph(d, graphX, graphTop, graphW, graphH, snap.VPNRXBandwidthHistory, snap.VPNTXBandwidthHistory, snap.VPNRXKBps, snap.VPNTXKBps)
+			markRendered(graphTop + graphH - 1)
 		}
 	} else if errMsg, ok := snap.Errors["vpn"]; ok && sectionFits(y) {
-		drawSectionHeader(d, leftX, y, "VPN")
+		y = alignSectionTop(y, "VPN")
+		drawSectionHeaderWithStatus(d, leftX, y, "VPN", false)
+		markRendered(sectionHeaderDividerY(y, "VPN"))
 		y += lh
 		if canDrawLine(y) {
 			drawText(d, leftX, y, ColorError, "Error: "+errMsg)
+			markRendered(y)
 		}
 		y += lh
 	}
+	y += 2
 
-	// ── Messages (pinned to the bottom 80 px) ────────────────────────────
-	drawSectionHeader(d, leftX, msgTop+2, "Messages")
-	msgY := msgTop + 2 + lh
-	for _, msg := range snap.Messages {
-		if msgY > h-4 {
-			break
+	// ── Services ─────────────────────────────────────────────────────────
+	if sectionFits(y) {
+		y = alignSectionTop(y, "Services")
+		drawSectionHeader(d, leftX, y, "Services")
+		markRendered(sectionHeaderDividerY(y, "Services"))
+		y += lh
+
+		mdnsRunning := snap.MDNS != nil && snap.MDNS.Running
+		mdnsHost := "-"
+		if snap.MDNS != nil && snap.MDNS.Hostname != "" {
+			mdnsHost = snap.MDNS.Hostname
 		}
-		drawText(d, leftX, msgY, ColorMessage, "- "+msg)
-		msgY += lh
+		sshRunning := snap.SSH != nil && snap.SSH.Running
+		entries := []statusTableEntry{
+			{label: fmt.Sprintf("mDNS: %s", mdnsHost), ok: mdnsRunning, textColor: ColorText},
+			{label: "SSH", ok: sshRunning, textColor: ColorText},
+		}
+		seenLabels := make(map[string]struct{}, len(entries))
+		for _, entry := range entries {
+			seenLabels[entry.label] = struct{}{}
+		}
+		for _, proxySite := range snap.ProxySites {
+			label := fmt.Sprintf("mDNS: %s", proxySite)
+			if _, exists := seenLabels[label]; exists {
+				continue
+			}
+			seenLabels[label] = struct{}{}
+			entries = append(entries, statusTableEntry{label: label, ok: true, textColor: ColorText})
+		}
+
+		sep := " | "
+		sepW := textBounds(sep).Dx()
+		maxX := w - iconPadding
+		x := leftX
+		rowHasItems := false
+
+		for _, entry := range entries {
+			if !canDrawLine(y) {
+				break
+			}
+
+			entryW := statusEntryWidth(lh, entry.label)
+			neededW := entryW
+			if rowHasItems {
+				neededW += sepW
+			}
+
+			if rowHasItems && x+neededW > maxX {
+				y += lh
+				if !canDrawLine(y) {
+					break
+				}
+				x = leftX
+				rowHasItems = false
+			}
+
+			if rowHasItems {
+				drawText(d, x, y, ColorSectionHdr, sep)
+				x += sepW
+			}
+
+			textX := drawStatusIndicatorAt(d, x, y, lh, entry.ok)
+			drawText(d, textX, y, entry.textColor, entry.label)
+			markRendered(y)
+			x = textX + textBounds(entry.label).Dx()
+			rowHasItems = true
+		}
+		y += lh
+
+		if errMsg, ok := snap.Errors["mdns"]; ok {
+			if canDrawLine(y) {
+				drawText(d, leftX, y, ColorError, "mDNS error: "+errMsg)
+				markRendered(y)
+			}
+			y += lh
+		}
+		if errMsg, ok := snap.Errors["ssh"]; ok {
+			if canDrawLine(y) {
+				drawText(d, leftX, y, ColorError, "SSH error : "+errMsg)
+				markRendered(y)
+			}
+			y += lh
+		}
+		if errMsg, ok := snap.Errors["proxy"]; ok {
+			if canDrawLine(y) {
+				drawText(d, leftX, y, ColorError, "Proxy error: "+errMsg)
+				markRendered(y)
+			}
+			y += lh
+		}
+
+		y += 2
+	}
+
+	// ── Messages (consume remaining space) ───────────────────────────────
+	if sectionFits(y) {
+		y = alignSectionTop(y, "Messages")
+		drawSectionHeader(d, leftX, y, "Messages")
+		markRendered(sectionHeaderDividerY(y, "Messages"))
+		y += lh
+		for _, msg := range snap.Messages {
+			if !canDrawLine(y) {
+				break
+			}
+			drawText(d, leftX, y, ColorMessage, "- "+msg)
+			markRendered(y)
+			y += lh
+		}
+	}
+
+	return d.Flush()
+}
+
+// RenderNeedsRebootNotice overwrites the display with a high-visibility
+// reboot-required warning suitable for system shutdown.
+func (sd *SystemDisplay) RenderNeedsRebootNotice() error {
+	d := sd.dev
+	w := d.Width()
+	h := d.Height()
+	if w <= 0 || h <= 0 {
+		return nil
+	}
+
+	full := image.Rect(0, 0, w, h)
+	border := warningBorderThickness(w, h)
+	hashSpacing := border
+	if hashSpacing < 10 {
+		hashSpacing = 10
+	}
+	hashWidth := hashSpacing / 3
+	if hashWidth < 3 {
+		hashWidth = 3
+	}
+
+	fillRectWithDiagonalHashes(d, full, ColorWarningBg, ColorWarningInk, hashSpacing, hashWidth)
+
+	inner := full.Inset(border)
+	if inner.Dx() <= 0 || inner.Dy() <= 0 {
+		return d.Flush()
+	}
+	d.DrawRect(inner.Min.X, inner.Min.Y, inner.Dx(), inner.Dy(), ColorBackground)
+
+	padding := border / 2
+	if padding < 8 {
+		padding = 8
+	}
+	textArea := inner.Inset(padding)
+	if textArea.Dx() <= 0 || textArea.Dy() <= 0 {
+		return d.Flush()
+	}
+
+	lines, scale := chooseNeedsRebootLayout(textArea.Dx(), textArea.Dy())
+	if scale < 1 {
+		scale = 1
+	}
+
+	lineAdvance := basicfont.Face7x13.Metrics().Height.Ceil() * scale
+	lineGap := 4 * scale
+	totalHeight := len(lines) * lineAdvance
+	if len(lines) > 1 {
+		totalHeight += (len(lines) - 1) * lineGap
+	}
+
+	y := textArea.Min.Y + (textArea.Dy()-totalHeight)/2
+	for idx, line := range lines {
+		lineBounds := textBounds(line)
+		lineWidth := lineBounds.Dx() * scale
+		x := textArea.Min.X + (textArea.Dx()-lineWidth)/2
+		_, _ = drawTextScaled(d, x, y, ColorWarningTxt, line, scale)
+		y += lineAdvance
+		if idx < len(lines)-1 {
+			y += lineGap
+		}
 	}
 
 	return d.Flush()
@@ -370,6 +555,149 @@ func emptyDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+func textBounds(text string) image.Rectangle {
+	dr := &font.Drawer{Face: basicfont.Face7x13}
+	bounds26_6, _ := dr.BoundString(text)
+	return image.Rectangle{
+		Min: image.Point{X: bounds26_6.Min.X.Round(), Y: bounds26_6.Min.Y.Round()},
+		Max: image.Point{X: bounds26_6.Max.X.Round(), Y: bounds26_6.Max.Y.Round()},
+	}
+}
+
+// drawTextScaled renders text at an integer pixel scale using the same drawing
+// path as drawText.  It renders into a temporary ImageDevice at 1× first (so
+// the proven NRGBA + font.Drawer path is used unchanged), then scales every
+// set pixel up to scale×scale blocks on the target device.
+func drawTextScaled(dev Device, x, y int, c color.Color, text string, scale int) (image.Rectangle, error) {
+	if scale < 1 {
+		scale = 1
+	}
+	bounds := textBounds(text)
+	if bounds.Dx() <= 0 || bounds.Dy() <= 0 {
+		return image.Rect(x, y, x, y), nil
+	}
+
+	// Render at 1× into an off-screen ImageDevice so we can read back pixels.
+	tmp := NewImageDevice(bounds.Dx(), bounds.Dy())
+	// drawText places the baseline at (x, y); shift so baseline sits inside
+	// the tmp buffer: baseline row = -bounds.Min.Y (the ascender offset).
+	drawText(tmp, -bounds.Min.X, -bounds.Min.Y, c, text)
+
+	// Scale every coloured pixel up onto the real device.
+	for py := 0; py < bounds.Dy(); py++ {
+		for px := 0; px < bounds.Dx(); px++ {
+			col := tmp.img.NRGBAAt(px, py)
+			if col.A == 0 {
+				continue
+			}
+			dev.DrawRect(x+px*scale, y+py*scale, scale, scale, col)
+		}
+	}
+
+	scaledBounds := image.Rect(x, y, x+bounds.Dx()*scale, y+bounds.Dy()*scale)
+	canvasBounds := image.Rect(0, 0, dev.Width(), dev.Height())
+	if !scaledBounds.In(canvasBounds) {
+		return scaledBounds, fmt.Errorf("text bounds %v exceed canvas %v", scaledBounds, canvasBounds)
+	}
+	return scaledBounds, nil
+}
+
+func warningBorderThickness(w, h int) int {
+	minDim := w
+	if h < minDim {
+		minDim = h
+	}
+	border := minDim / 10
+	if border < 12 {
+		border = 12
+	}
+	if border > 40 {
+		border = 40
+	}
+	if border*2 >= minDim {
+		border = minDim / 6
+		if border < 2 {
+			border = 2
+		}
+	}
+	return border
+}
+
+func chooseNeedsRebootLayout(availW, availH int) ([]string, int) {
+	candidates := [][]string{
+		{"NEEDS REBOOT"},
+		{"NEEDS", "REBOOT"},
+	}
+
+	baseLineHeight := basicfont.Face7x13.Metrics().Height.Ceil()
+	const baseGap = 4
+
+	bestLines := candidates[0]
+	bestScale := 1
+	bestArea := -1
+
+	for _, lines := range candidates {
+		maxWidth := 0
+		totalHeight := len(lines) * baseLineHeight
+		if len(lines) > 1 {
+			totalHeight += (len(lines) - 1) * baseGap
+		}
+		for _, line := range lines {
+			lineWidth := textBounds(line).Dx()
+			if lineWidth > maxWidth {
+				maxWidth = lineWidth
+			}
+		}
+		if maxWidth <= 0 || totalHeight <= 0 {
+			continue
+		}
+
+		scaleW := availW / maxWidth
+		scaleH := availH / totalHeight
+		scale := scaleW
+		if scaleH < scale {
+			scale = scaleH
+		}
+		if scale < 1 {
+			scale = 1
+		}
+
+		area := maxWidth * totalHeight * scale * scale
+		if scale > bestScale || (scale == bestScale && area > bestArea) {
+			bestLines = lines
+			bestScale = scale
+			bestArea = area
+		}
+	}
+
+	return bestLines, bestScale
+}
+
+func fillRectWithDiagonalHashes(dev Device, rect image.Rectangle, bg, hash color.Color, spacing, hashWidth int) {
+	if spacing < 2 {
+		spacing = 2
+	}
+	if hashWidth < 1 {
+		hashWidth = 1
+	}
+	canvas := image.Rect(0, 0, dev.Width(), dev.Height())
+	rect = rect.Intersect(canvas)
+	if rect.Empty() {
+		return
+	}
+
+	for y := rect.Min.Y; y < rect.Max.Y; y++ {
+		for x := rect.Min.X; x < rect.Max.X; x++ {
+			pattern := (x - rect.Min.X) + (y - rect.Min.Y)
+			if pattern%spacing < hashWidth {
+				dev.SetPixel(x, y, hash)
+				continue
+			}
+			dev.SetPixel(x, y, bg)
+		}
+	}
 }
 
 func networkCIDR(ip, netmask, cidr string) string {
@@ -791,11 +1119,20 @@ func formatScaleRate(v float64) string {
 // the standard left margin, and returns the x position for the text label
 // that follows.  ok=true draws in ColorOK; ok=false in ColorError.
 func (sd *SystemDisplay) drawStatusIndicator(ok bool, y, lineH int) int {
+	return drawStatusIndicatorAt(sd.dev, iconPadding, y, lineH, ok)
+}
+
+func drawStatusIndicatorAt(dev Device, x, y, lineH int, ok bool) int {
 	cr := lineH/2 - 2
-	cx := iconPadding + cr
+	cx := x + cr
 	cy := y - cr
-	sd.dev.DrawCircle(cx, cy, cr, statusColour(ok))
+	dev.DrawCircle(cx, cy, cr, statusColour(ok))
 	return cx + cr + iconTextGap
+}
+
+func statusEntryWidth(lineH int, label string) int {
+	cr := lineH/2 - 2
+	return cr*2 + iconTextGap + textBounds(label).Dx()
 }
 
 // statusColour maps a boolean ok/running/connected flag to its palette entry.
