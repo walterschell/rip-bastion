@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -23,10 +24,36 @@ import (
 	"time"
 )
 
+// Shared transport for all reverse proxies. Using a single transport allows
+// connection pooling across all backends and prevents resource exhaustion.
+var sharedTransport = &http.Transport{
+	DialContext: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	MaxIdleConns:          200,
+	MaxIdleConnsPerHost:   20,
+	MaxConnsPerHost:       100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ResponseHeaderTimeout: 0, // no timeout; rely on server timeouts
+	ForceAttemptHTTP2:     true,
+	// Disable keep-alives if they're causing connection reuse issues.
+	// DisableKeepAlives: true,
+}
+
+// wsDialer is used for WebSocket backend connections.
+var wsDialer = &net.Dialer{
+	Timeout:   30 * time.Second,
+	KeepAlive: 30 * time.Second,
+}
+
 // routeTable is the hot-swappable routing state derived from a Config.
 type routeTable struct {
 	cfg     *Config
 	proxies map[string]*httputil.ReverseProxy // normalised host → backend proxy
+	targets map[string]*url.URL               // normalised host → backend URL (for WebSocket)
 	certs   map[string]*tls.Certificate       // normalised host → TLS cert
 }
 
@@ -113,6 +140,7 @@ func (s *Server) apply(cfg *Config) error {
 // buildRouteTable constructs proxies and TLS certs for every route in cfg.
 func buildRouteTable(cfg *Config) (*routeTable, error) {
 	proxies := make(map[string]*httputil.ReverseProxy, len(cfg.Routes))
+	targets := make(map[string]*url.URL, len(cfg.Routes))
 	certs := make(map[string]*tls.Certificate, len(cfg.Routes))
 
 	for _, r := range cfg.Routes {
@@ -126,12 +154,48 @@ func buildRouteTable(cfg *Config) (*routeTable, error) {
 		if err != nil {
 			return nil, fmt.Errorf("route %q: invalid target URL %q: %w", r.Name, r.Target, err)
 		}
-		rp := httputil.NewSingleHostReverseProxy(target)
-		rp.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
-			log.Printf("proxy: upstream error [%s → %s]: %v", req.Host, target, err)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+
+		// Create a custom Director that preserves X-Forwarded headers and handles
+		// path joining correctly.
+		targetURL := target // capture for closure
+		director := func(req *http.Request) {
+			req.URL.Scheme = targetURL.Scheme
+			req.URL.Host = targetURL.Host
+			req.Host = targetURL.Host
+
+			// Join paths if target has a path prefix.
+			if targetURL.Path != "" && targetURL.Path != "/" {
+				req.URL.Path = singleJoiningSlash(targetURL.Path, req.URL.Path)
+			}
+
+			// Preserve or set X-Forwarded headers for the backend.
+			if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+				if prior := req.Header.Get("X-Forwarded-For"); prior != "" {
+					req.Header.Set("X-Forwarded-For", prior+", "+clientIP)
+				} else {
+					req.Header.Set("X-Forwarded-For", clientIP)
+				}
+			}
+			if req.TLS != nil {
+				req.Header.Set("X-Forwarded-Proto", "https")
+			} else {
+				req.Header.Set("X-Forwarded-Proto", "http")
+			}
+		}
+
+		rp := &httputil.ReverseProxy{
+			Director:      director,
+			Transport:     sharedTransport,
+			FlushInterval: 100 * time.Millisecond,
+			ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
+				log.Printf("proxy: upstream error [%s → %s]: %v", req.Host, targetURL, err)
+				// Close connection on error to prevent reusing broken connections.
+				w.Header().Set("Connection", "close")
+				http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			},
 		}
 		proxies[normaliseHost(r.Host)] = rp
+		targets[normaliseHost(r.Host)] = target
 
 		// Build or load the TLS certificate.
 		var cert *tls.Certificate
@@ -147,7 +211,7 @@ func buildRouteTable(cfg *Config) (*routeTable, error) {
 		certs[normaliseHost(r.Host)] = cert
 	}
 
-	return &routeTable{cfg: cfg, proxies: proxies, certs: certs}, nil
+	return &routeTable{cfg: cfg, proxies: proxies, targets: targets, certs: certs}, nil
 }
 
 // ListenAndServe starts the HTTP (redirect) and HTTPS (proxy) servers and
@@ -164,12 +228,15 @@ func (s *Server) ListenAndServe() error {
 		MinVersion:     tls.VersionTLS12,
 	}
 	httpsServer := &http.Server{
-		Addr:         httpsAddr,
-		Handler:      http.HandlerFunc(s.serveHTTPS),
-		TLSConfig:    tlsCfg,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:      httpsAddr,
+		Handler:   http.HandlerFunc(s.serveHTTPS),
+		TLSConfig: tlsCfg,
+		// Timeouts disabled to support WebSockets and large uploads/downloads.
+		// Backend and client timeouts handle idle connection cleanup.
+		ReadTimeout:       0,
+		WriteTimeout:      0,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 
 	// --- HTTP redirect server ---
@@ -222,12 +289,14 @@ func (s *Server) ListenAndServeContext(ctx context.Context) error {
 		MinVersion:     tls.VersionTLS12,
 	}
 	httpsServer := &http.Server{
-		Addr:         httpsAddr,
-		Handler:      http.HandlerFunc(s.serveHTTPS),
-		TLSConfig:    tlsCfg,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:      httpsAddr,
+		Handler:   http.HandlerFunc(s.serveHTTPS),
+		TLSConfig: tlsCfg,
+		// Timeouts disabled to support WebSockets and large uploads/downloads.
+		ReadTimeout:       0,
+		WriteTimeout:      0,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 	httpServer := &http.Server{
 		Addr:         httpAddr,
@@ -308,16 +377,148 @@ func (s *Server) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, e
 }
 
 // serveHTTPS handles HTTPS requests: route to the matching backend or show the
-// fallback page.
+// fallback page. WebSocket upgrade requests are handled via TCP tunnel.
 func (s *Server) serveHTTPS(w http.ResponseWriter, r *http.Request) {
 	t := s.currentTable()
 	key := normaliseHost(r.Host)
+
+	// Check for WebSocket upgrade request.
+	if isWebSocketUpgrade(r) {
+		if target, ok := t.targets[key]; ok {
+			s.handleWebSocket(w, r, target)
+			return
+		}
+		http.Error(w, "No backend for WebSocket", http.StatusBadGateway)
+		return
+	}
+
 	if rp, ok := t.proxies[key]; ok {
 		rp.ServeHTTP(w, r)
 		return
 	}
 	// Fallback: show the route listing.
 	serveFallback(w, r, t.cfg.Fallback.Title, t.cfg.Routes)
+}
+
+// isWebSocketUpgrade checks if the request is a WebSocket upgrade.
+func isWebSocketUpgrade(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
+}
+
+// handleWebSocket proxies a WebSocket connection by hijacking the client conn
+// and establishing a TCP tunnel to the backend.
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request, target *url.URL) {
+	// Determine backend address.
+	backendHost := target.Host
+	if target.Port() == "" {
+		if target.Scheme == "https" {
+			backendHost = target.Host + ":443"
+		} else {
+			backendHost = target.Host + ":80"
+		}
+	}
+
+	// Dial the backend with context for cancellation.
+	ctx := r.Context()
+	backendConn, err := wsDialer.DialContext(ctx, "tcp", backendHost)
+	if err != nil {
+		log.Printf("proxy: WebSocket dial to %s failed: %v", backendHost, err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+
+	// Enable TCP keepalive on the backend connection.
+	if tcpConn, ok := backendConn.(*net.TCPConn); ok {
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	// Hijack the client connection.
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		backendConn.Close()
+		log.Printf("proxy: WebSocket hijack not supported")
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	clientConn, clientBuf, err := hijacker.Hijack()
+	if err != nil {
+		backendConn.Close()
+		log.Printf("proxy: WebSocket hijack failed: %v", err)
+		return
+	}
+
+	// Enable TCP keepalive on the client connection.
+	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	// Rewrite the request URL path to include the target path prefix if any.
+	outReq := r.Clone(context.Background()) // fresh context, not tied to HTTP handler
+	outReq.URL.Scheme = target.Scheme
+	outReq.URL.Host = target.Host
+	if target.Path != "" && target.Path != "/" {
+		outReq.URL.Path = singleJoiningSlash(target.Path, r.URL.Path)
+	}
+	outReq.Host = target.Host
+	outReq.RequestURI = outReq.URL.RequestURI()
+
+	// Add X-Forwarded headers for the backend.
+	if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		outReq.Header.Set("X-Forwarded-For", clientIP)
+	}
+	outReq.Header.Set("X-Forwarded-Proto", "https")
+
+	// Forward the request to backend (including Upgrade headers).
+	if err := outReq.Write(backendConn); err != nil {
+		clientConn.Close()
+		backendConn.Close()
+		log.Printf("proxy: WebSocket forward request failed: %v", err)
+		return
+	}
+
+	// Flush any buffered data from the client.
+	if clientBuf.Reader.Buffered() > 0 {
+		buffered := make([]byte, clientBuf.Reader.Buffered())
+		_, _ = clientBuf.Read(buffered)
+		_, _ = backendConn.Write(buffered)
+	}
+
+	// Bidirectional copy with proper shutdown.
+	// When one direction ends, close both connections to unblock the other.
+	var once sync.Once
+	closeAll := func() {
+		clientConn.Close()
+		backendConn.Close()
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(backendConn, clientConn)
+		once.Do(closeAll)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(clientConn, backendConn)
+		once.Do(closeAll)
+	}()
+	wg.Wait()
+}
+
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
+	}
+	return a + b
 }
 
 // serveHTTPRedirect responds to plain-HTTP requests with a 301 redirect to
